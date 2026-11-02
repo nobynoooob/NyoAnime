@@ -57,7 +57,8 @@ Switch providers in Settings (`c` / `O`) or with the `-p` flag:
 | **Anime3rb** | `anime3rb` | Arabic Sub | Direct CDN streams with quality selection |
 | **Anime Slayer** | `anime_slayer` | Arabic Sub | Official API endpoints with backup servers |
 | **Animeify** | `animeify` | Arabic Sub | Mirror servers and fast resolution switching |
-| **HiAnime** | `hianime` | English Sub / Dub | English streams with dynamic referer resolution |
+| **HiAnime Sub** | `hianime` | English Sub | HLS variants, English subtitle track, referer-safe playback |
+| **HiAnime Dub** | `hianime_dub` | English Dub | English audio source with the same HLS resolver |
 | **Stardima** | `stardima` | Arabic Dub | Multi-server streams with Arabic audio selection |
 | **Stardima Kids** | `stardima_kids` | Arabic Dub | Dubbed cartoons and kids series |
 
@@ -177,6 +178,8 @@ Preferences live at:
 
 Open Settings with <kbd>c</kbd> or <kbd>O</kbd> to change:
 
+- Preferred language (`ar_sub`, `en_sub`, `en_dub`)
+- Automatic provider selection
 - Active provider
 - Stardima audio language (`dub`, `sub`, `both`)
 - Default streaming and download quality
@@ -204,7 +207,7 @@ Build a standalone executable with `scripts/build.py` (PyInstaller required).
 
 ## License
 
-GNU General Public License v3.0. See [LICENSE](LICENSE).
+GNU General Public License v3.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for the ani-cli attribution covering the HiAnime provider port.
 
 <div align="center">
   <p>Created and maintained by <strong>NoBy</strong>.</p>

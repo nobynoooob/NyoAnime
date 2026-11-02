@@ -251,6 +251,9 @@ class NyoAnimeWrapper:
             start_time=start_time,
             audio_lang=audio_lang or None,
             headers=headers,
+            subtitle_url=getattr(selected_q, 'subtitle_url', '') or None,
+            subtitle_lang=getattr(selected_q, 'subtitle_lang', '') or None,
+            audio_url=getattr(selected_q, 'audio_url', '') or None,
         )
 
         pos = playback_info.get('time_pos', 0.0) if isinstance(playback_info, dict) else 0.0
@@ -788,11 +791,54 @@ class NyoAnimeWrapper:
                 if m:
                     p_id = m.group(1)
             if p_id:
-                ProviderManager.set_active_provider(p_id)
-                self.api = ProviderManager.get_provider(p_id)
-                self.settings_manager.set("anime_provider", p_id)
+                from .providers.language import provider_language_mode
+                canonical = ProviderManager.get_canonical_id(p_id)
+                ProviderManager.set_active_provider(canonical)
+                self.api = ProviderManager.get_provider(canonical)
+                self.settings_manager.set("anime_provider", canonical)
+                self.settings_manager.set("language_mode", provider_language_mode(canonical))
+                self.settings_manager.set("auto_provider", False)
                 self.console.print(f"\n[green]✔ Switched active provider to: {self.api.name}[/green]")
                 time.sleep(0.8)
+
+    def _switch_language(self):
+        from .providers.language import LANGUAGE_MODES, language_mode_label
+
+        current = self.settings_manager.get("language_mode")
+        lines = []
+        mapping = {}
+        for mode in LANGUAGE_MODES:
+            badge = " \033[32m[Active]\033[0m" if mode == current else ""
+            label = language_mode_label(mode)
+            line = f"\033[1m{label}\033[0m [{mode}]{badge}"
+            lines.append(line)
+            mapping[line] = mode
+            mapping[label] = mode
+            mapping[mode] = mode
+
+        selected = self._launcher(lines, "Preferred Anime Language")
+        if not selected:
+            return
+        mode = mapping.get(selected[0])
+        if not mode:
+            match = re.search(r"\[([a-z_]+)\]", selected[0])
+            mode = match.group(1) if match else None
+        if not mode:
+            return
+
+        settings = self.settings_manager
+        settings.set("language_mode", mode)
+        provider_id = ProviderManager.resolve_active_provider(
+            settings, mode=mode, preferred_provider=settings.get("anime_provider"), auto=True
+        )
+        settings.set("anime_provider", provider_id)
+        settings.set("auto_provider", True)
+        ProviderManager.set_active_provider(provider_id)
+        self.api = ProviderManager.get_provider(provider_id)
+        self.console.print(
+            f"\n[green]✔ Switched language to: {language_mode_label(mode)} ({self.api.name})[/green]"
+        )
+        time.sleep(0.8)
 
     def _show_settings_menu(self):
         """Native fzf settings dialog for -i CLI mode."""
@@ -806,6 +852,9 @@ class NyoAnimeWrapper:
             cur_auto = "ON" if self.settings_manager.get('auto_next', False) else "OFF"
             cur_rpc = "ON" if self.settings_manager.get('discord_rpc', True) else "OFF"
             cur_theme = self.settings_manager.get('theme', 'auto')
+            from .providers.language import language_mode_label
+            cur_lang = language_mode_label(self.settings_manager.get('language_mode'))
+            cur_auto_provider = "ON" if self.settings_manager.get('auto_provider', True) else "OFF"
 
             options = [
                 f"\033[36m1. Provider:\033[0m           {cur_prov}",
@@ -816,6 +865,8 @@ class NyoAnimeWrapper:
                 f"\033[36m6. Autoplay Next:\033[0m      {cur_auto}",
                 f"\033[36m7. Discord RPC:\033[0m        {cur_rpc}",
                 f"\033[36m8. Theme:\033[0m              {cur_theme}",
+                f"\033[36m9. Language:\033[0m           {cur_lang}",
+                f"\033[36m10. Auto Provider:\033[0m      {cur_auto_provider}",
                 "← Back to Main Menu"
             ]
 
@@ -824,7 +875,21 @@ class NyoAnimeWrapper:
                 break
 
             choice = ansi_escape.sub('', sel[0])
-            if "Provider:" in choice:
+            if "Auto Provider:" in choice:
+                new_auto = not bool(self.settings_manager.get("auto_provider", True))
+                self.settings_manager.set("auto_provider", new_auto)
+                if new_auto:
+                    provider_id = ProviderManager.resolve_active_provider(self.settings_manager, auto=True)
+                    self.settings_manager.set("anime_provider", provider_id)
+                    ProviderManager.set_active_provider(provider_id)
+                    self.api = ProviderManager.get_provider(provider_id)
+                self.console.print(
+                    f"\nAuto Provider: {'[green]ON[/green]' if new_auto else '[yellow]OFF[/yellow]'}"
+                )
+                time.sleep(0.6)
+            elif "Language:" in choice:
+                self._switch_language()
+            elif "Provider:" in choice:
                 self._switch_provider()
             elif "Video Player:" in choice:
                 players = ["mpv", "vlc", "celluloid", "iina", "syncplay", "mpc-hc"]
@@ -930,14 +995,18 @@ class NyoAnimeWrapper:
             self.console.print(f"  [bold {title_col}]NYO ANIME[/bold {title_col}]")
 
         active_prov = getattr(self.api, 'name', 'Anime3rb')
-        active_prov = active_prov.replace(" (English)", "").replace(" Provider", "").strip()
+        for suffix in (" (English Sub)", " (English Dub)", " (English)", " Provider"):
+            active_prov = active_prov.replace(suffix, "")
+        active_prov = active_prov.strip()
+        from .providers.language import language_mode_label
+        mode_label = language_mode_label(self.settings_manager.get("language_mode"))
 
         meta = Text("  [ ", style=f"dim {border_col}")
         meta.append(APP_VERSION, style=f"bold {title_col}")
         meta.append(" • ", style=f"dim {border_col}")
         meta.append("by NoBy", style="dim")
         meta.append(" • ", style=f"dim {border_col}")
-        meta.append(active_prov, style=f"bold {title_col}")
+        meta.append(f"{active_prov} • {mode_label}", style=f"bold {title_col}")
         meta.append(" ]", style=f"dim {border_col}")
         self.console.print(meta)
 
@@ -1143,8 +1212,9 @@ def run_simple_cli(query: Optional[str] = None, deps: Optional[Dict[str, Any]] =
         settings = deps.get('settings') or SettingsManager()
         rpc = deps.get('rpc') or DiscordRPCManager()
     else:
-        api = ProviderManager.get_provider()
         settings = SettingsManager()
+        provider_id = ProviderManager.sync_active_provider(settings)
+        api = ProviderManager.get_provider(provider_id)
         rpc = DiscordRPCManager()
         player = PlayerManager(rpc_manager=rpc)
         history = HistoryManager()

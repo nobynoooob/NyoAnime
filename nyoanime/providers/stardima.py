@@ -97,6 +97,9 @@ class StardimaProvider(BaseAnimeProvider):
     id: str = "stardima"
     name: str = "Stardima Anime (Dub)"
     description: str = "Arabic dubbed anime with direct backup streams"
+    language = "ar"
+    audio_mode = "dub"
+    language_mode = "ar_sub"
 
     content_scope: str = "anime"
 
@@ -823,5 +826,8 @@ class StardimaKidsProvider(StardimaProvider):
     id: str = "stardima_kids"
     name: str = "Stardima Kids (Cartoon)"
     description: str = "Arabic dubbed cartoons for kids with direct backup streams"
+    language = "ar"
+    audio_mode = "dub"
+    language_mode = "ar_sub"
 
     content_scope: str = "cartoon"

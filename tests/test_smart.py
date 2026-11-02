@@ -539,11 +539,11 @@ class TestEdgeCasesAndBoundaryConditions:
         assert 'movies' in sd_txt
         assert 'genres' in sd_txt
 
-        # 3. HiAnime lacks movies, studios, genres, trending, top rated
+        # 3. HiAnime now exposes the full English catalogue
         ha_txt = render_home_screen('hianime')
-        assert 'studios' not in ha_txt
-        assert 'movies' not in ha_txt
-        assert 'genres' not in ha_txt
+        assert 'studios' in ha_txt
+        assert 'movies' in ha_txt
+        assert 'genres' in ha_txt
         assert 'latest eps' in ha_txt
         assert 'popular' in ha_txt
 

@@ -100,6 +100,9 @@ class AnimeifyProvider(BaseAnimeProvider):
     id: str = "animeify"
     name: str = "Animeify"
     description: str = "Original Animeify API provider with remote credential authentication"
+    language = "ar"
+    audio_mode = "sub"
+    language_mode = "ar_sub"
 
     DEFAULT_USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

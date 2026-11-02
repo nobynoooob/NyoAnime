@@ -65,10 +65,9 @@ class NyoAnimeApp:
         self.settings = SettingsManager()
         if self.settings.get("debug_logging"):
             logger.enable()
-        active_provider_id = self.settings.get("anime_provider") or "anime3rb"
-        self.provider = ProviderManager.get_provider(active_provider_id)
-        self.api = self.provider
-        ProviderManager.set_active_provider(active_provider_id)
+        self.provider = None
+        self.api = None
+        self._sync_active_provider()
         self.rpc = DiscordRPCManager()
         self.player = PlayerManager(rpc_manager=self.rpc, console=self.ui.console)
         self.history = HistoryManager()
@@ -78,13 +77,24 @@ class NyoAnimeApp:
         self.force_cli = False
         self._cleaned_up = False
 
+    def _sync_active_provider(self):
+        """Re-resolve the provider from language settings and refresh both handles."""
+        provider_id = ProviderManager.sync_active_provider(self.settings)
+        self.provider = ProviderManager.get_provider(provider_id)
+        self.api = self.provider
+        return provider_id
+
     def run(self):
         parser = argparse.ArgumentParser(
-            description="NyoAnime: A CLI tool to browse and watch anime in Arabic.",
+            description="NyoAnime: A CLI tool to browse and watch anime in Arabic and English.",
             formatter_class=argparse.RawTextHelpFormatter
         )
         parser.add_argument('-i', '--interactive', action='store_true', help="Force minimal interactive CLI mode")
-        parser.add_argument('-p', '--provider', choices=ProviderManager.get_provider_choices(), help="Specify active anime provider (anime3rb, anime_slayer, animeify, hianime, stardima, stardima_kids)")
+        parser.add_argument(
+            '-p', '--provider',
+            choices=ProviderManager.get_provider_choices(),
+            help="Specify active anime provider (Arabic: anime3rb, anime_slayer, animeify, stardima; English: hianime, hianime_dub)"
+        )
         parser.add_argument('-d', '--debug', action='store_true', help="Enable verbose debug logging to file and console")
         parser.add_argument('-v', '--version', action='store_true', help="Show version information")
         parser.add_argument('query', nargs='*', help="Anime name to search for")
@@ -96,10 +106,14 @@ class NyoAnimeApp:
             logger.debug("APP", "CLI flag --debug specified, verbose console mirror enabled")
 
         if args.provider:
-            self.provider = ProviderManager.get_provider(args.provider)
-            self.api = self.provider
-            ProviderManager.set_active_provider(args.provider)
-            logger.debug("APP", f"CLI flag --provider specified, active provider set to {args.provider}")
+            from .providers.language import provider_language_mode
+
+            provider_id = ProviderManager.get_canonical_id(args.provider)
+            self.settings.set("anime_provider", provider_id)
+            self.settings.set("language_mode", provider_language_mode(provider_id))
+            self.settings.set("auto_provider", False)
+            self._sync_active_provider()
+            logger.debug("APP", f"CLI flag --provider specified, active provider set to {provider_id}")
             
         if args.version:
             from .version import __version__
@@ -193,10 +207,7 @@ class NyoAnimeApp:
                 return "SWITCH_TO_CLI"
 
             # Always synchronize active provider directly from settings before home screen/actions
-            active_provider_id = self.settings.get("anime_provider") or "anime3rb"
-            self.provider = ProviderManager.get_provider(active_provider_id)
-            self.api = self.provider
-            ProviderManager.set_active_provider(active_provider_id)
+            self._sync_active_provider()
 
             if query_override:
                 action, payload = "search", query_override
@@ -278,10 +289,7 @@ class NyoAnimeApp:
             elif action == "settings":
                 self.rpc.update_settings()
                 self.ui.settings_menu(self.settings)
-                active_provider_id = self.settings.get("anime_provider") or "anime3rb"
-                self.provider = ProviderManager.get_provider(active_provider_id)
-                self.api = self.provider
-                ProviderManager.set_active_provider(active_provider_id)
+                self._sync_active_provider()
                 continue
 
             elif action == "changelog":
@@ -797,6 +805,7 @@ class NyoAnimeApp:
                 'studio': selected_anime.creators,
                 'genres': selected_anime.genres,
                 'language': getattr(selected_anime, 'language', ''),
+                'provider_language': getattr(self.api, 'language', ''),
                 'content_type': getattr(selected_anime, 'content_type', ''),
             }
 
@@ -839,6 +848,16 @@ class NyoAnimeApp:
             
             while True:
                 selected_ep = episodes[current_idx]
+                available_modes = getattr(selected_ep, 'available_modes', None) or []
+                requested_mode = getattr(self.api, 'audio_mode', '')
+                if available_modes and requested_mode in ('sub', 'dub') and requested_mode not in available_modes:
+                    label = "English Dub" if requested_mode == 'dub' else "English Sub"
+                    self.ui.render_message(
+                        "✗ Unavailable",
+                        f"{label} is not available for Episode {selected_ep.display_num}.",
+                        "info",
+                    )
+                    break
                 
                 server_data = self.ui.run_with_loading(
                     "Loading servers...",
@@ -1049,21 +1068,38 @@ class NyoAnimeApp:
             )
             return None
 
-        result = self.ui.quality_selection_menu(
-            selected_anime.title_en, 
-            selected_ep.display_num, 
-            available, 
-            self.rpc,
-            selected_anime.thumbnail
-        )
-        
-        if result == -1:
-            sys.exit(0)
-        if result is None:
-            return None
+        subtitles = getattr(available[0], 'subtitles', None) or []
+        subtitle_index = 0
+        while True:
+            result = self.ui.quality_selection_menu(
+                selected_anime.title_en, 
+                selected_ep.display_num, 
+                available, 
+                self.rpc,
+                selected_anime.thumbnail,
+                subtitle_options=subtitles,
+                subtitle_index=subtitle_index,
+            )
             
-        idx, action = result
+            if result == -1:
+                sys.exit(0)
+            if result is None:
+                return None
+
+            idx, action = result
+            if action == 'subtitle' and subtitles:
+                subtitle_index = (subtitle_index + 1) % (len(subtitles) + 1)
+                continue
+            break
+
         quality = available[idx]
+        if subtitles:
+            if subtitle_index < len(subtitles):
+                quality.subtitle_url = subtitles[subtitle_index].get('src', '')
+                quality.subtitle_lang = subtitles[subtitle_index].get('lang', '')
+            else:
+                quality.subtitle_url = ''
+                quality.subtitle_lang = ''
         direct_url = getattr(quality, 'direct_url', '') or getattr(quality, 'url', '') or current_ep_data.get(getattr(quality, 'server_key', ''))
 
         audio_lang = getattr(quality, 'audio_lang', '') or ''
@@ -1128,6 +1164,9 @@ class NyoAnimeApp:
                     start_time=actual_start,
                     audio_lang=audio_lang or None,
                     headers=headers,
+                    subtitle_url=getattr(quality, 'subtitle_url', '') or None,
+                    subtitle_lang=getattr(quality, 'subtitle_lang', '') or None,
+                    audio_url=getattr(quality, 'audio_url', '') or None,
                 )
                 self.ui.clear()
                 

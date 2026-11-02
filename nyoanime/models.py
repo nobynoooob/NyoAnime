@@ -49,6 +49,9 @@ class Episode:
     url: str = ""
     servers: List[Dict[str, Any]] = field(default_factory=list)
     anime_id: str = ""
+    # Language availability for the episode, e.g. "sub", "dub", "ar_sub".
+    language: str = ""
+    available_modes: List[str] = field(default_factory=list)
 
 @dataclass
 class QualityOption:
@@ -62,6 +65,11 @@ class QualityOption:
     headers: Dict[str, str] = field(default_factory=dict)
     audio_lang: str = ""  # mpv --alang preference, e.g. "ara,ar"
     ext: str = "mp4"  # container extension for downloads
+    # Optional sidecar tracks for providers that expose them separately.
+    subtitle_url: str = ""
+    subtitle_lang: str = ""
+    subtitles: List[Dict[str, str]] = field(default_factory=list)
+    audio_url: str = ""
 
     @property
     def url(self) -> str:

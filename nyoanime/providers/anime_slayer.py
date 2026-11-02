@@ -82,6 +82,9 @@ class AnimeSlayerProvider(BaseAnimeProvider):
     id: str = "anime_slayer"
     name: str = "Anime Slayer"
     description: str = "Official mobile API provider for Anime Slayer (أنمي سلاير)"
+    language = "ar"
+    audio_mode = "sub"
+    language_mode = "ar_sub"
 
     BASE_URL = "https://anslayer.com/anime/public/"
     CLIENT_ID = "android-app2"

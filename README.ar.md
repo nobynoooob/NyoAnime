@@ -57,7 +57,8 @@
 | **Anime3rb** | `anime3rb` | عربي مترجم | روابط CDN مباشرة مع اختيار الجودة |
 | **Anime Slayer** | `anime_slayer` | عربي مترجم | واجهات API رسمية مع سيرفرات بديلة |
 | **Animeify** | `animeify` | عربي مترجم | سيرفرات متعددة وتبديل سريع للجودة |
-| **HiAnime** | `hianime` | إنجليزي مترجم/مدبلج | بث إنجليزي مع حل مرجعي ديناميكي |
+| **HiAnime Sub** | `hianime` | إنجليزي مترجم | جودات HLS ومسار ترجمة إنجليزية مع Referer صحيح |
+| **HiAnime Dub** | `hianime_dub` | إنجليزي مدبلج | مصدر صوت إنجليزي بنفس محرك الاستخراج |
 | **Stardima** | `stardima` | عربي مدبلج | بث متعدد السيرفرات مع اختيار الصوت العربي |
 | **Stardima Kids** | `stardima_kids` | عربي مدبلج | كرتون ومسلسلات أطفال مدبلجة |
 
@@ -177,6 +178,8 @@ nyo --help          # دليل الخيارات
 
 افتح الإعدادات عبر <kbd>c</kbd> أو <kbd>O</kbd> لتغيير:
 
+- اللغة المفضلة (`ar_sub` أو `en_sub` أو `en_dub`)
+- الاختيار التلقائي للمزوّد
 - المزوّد النشط
 - لغة صوت Stardima (`dub` أو `sub` أو `both`)
 - جودة البث والتنزيل الافتراضية
@@ -204,7 +207,7 @@ python3 -m pytest -q
 
 ## الترخيص
 
-رخصة GNU General Public License v3.0. راجع [LICENSE](LICENSE).
+رخصة GNU General Public License v3.0. راجع [LICENSE](LICENSE) و[NOTICE](NOTICE) لإسناد ani-cli الخاص بمزوّد HiAnime.
 
 <div align="center">
   <p>صُنع وصيانة بواسطة <strong>NoBy</strong>.</p>

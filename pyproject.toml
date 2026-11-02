@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nyoanime"
 dynamic = ["version"]
-description = "Terminal-based anime streaming with Arabic subtitles"
+description = "Terminal-based anime streaming with Arabic and English sources"
 readme = "README.md"
 license = "GPL-3.0"
 authors = [
@@ -14,7 +14,7 @@ authors = [
 maintainers = [
     {name = "NoBy"}
 ]
-keywords = ["anime", "streaming", "cli", "arabic", "subtitles", "terminal"]
+keywords = ["anime", "streaming", "cli", "arabic", "english", "sub", "dub", "subtitles", "terminal"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",

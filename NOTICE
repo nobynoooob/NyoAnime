@@ -1,0 +1,19 @@
+# Third-Party Notices
+
+NyoAnime is licensed under the GNU General Public License v3.0.
+
+## ani-cli
+
+The HiAnime provider in `nyoanime/providers/hianime.py` is a Python port of the
+HiAnime search, episode, ZokoAnime embed, and HLS resolution logic from
+[`pystardust/ani-cli`](https://github.com/pystardust/ani-cli) 5.1.6.
+
+ani-cli is Copyright (C) pystardust and contributors, licensed under the
+GNU General Public License v3.0. The original script is available at:
+
+- https://github.com/pystardust/ani-cli
+- https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli
+
+NyoAnime does not execute ani-cli or any of its shell pipelines. Only the
+provider/resolution approach was adapted to native Python. Any redistribution
+of this project must continue to comply with the GPL-3.0.

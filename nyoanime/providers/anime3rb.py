@@ -16,6 +16,9 @@ class Anime3rbProvider(BaseAnimeProvider):
     id: str = "anime3rb"
     name: str = "Anime3rb"
     description: str = "Official web provider for Anime3rb (أنمي بالترجمة والدبلجة العربية)"
+    language = "ar"
+    audio_mode = "sub"
+    language_mode = "ar_sub"
 
     def __init__(self, api: Optional[AnimeAPI] = None):
         self.api = api or AnimeAPI()

@@ -306,6 +306,9 @@ class PlayerManager:
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
+        audio_url: Optional[str] = None,
     ) -> dict:
         available_players = self.get_available_players()
         default_result = {'time_pos': 0.0, 'duration': 0.0, 'percent': 0.0, 'completed': False}
@@ -366,6 +369,9 @@ class PlayerManager:
                     start_time=start_time,
                     audio_lang=audio_lang,
                     headers=headers,
+                    subtitle_url=subtitle_url,
+                    subtitle_lang=subtitle_lang,
+                    audio_url=audio_url,
                 )
             elif selected_player == 'Celluloid':
                 return self._play_celluloid(
@@ -375,6 +381,8 @@ class PlayerManager:
                     start_time=start_time,
                     audio_lang=audio_lang,
                     headers=headers,
+                    subtitle_url=subtitle_url,
+                    audio_url=audio_url,
                 )
             elif selected_player == 'IINA':
                 return self._play_iina(
@@ -384,6 +392,8 @@ class PlayerManager:
                     start_time=start_time,
                     audio_lang=audio_lang,
                     headers=headers,
+                    subtitle_url=subtitle_url,
+                    audio_url=audio_url,
                 )
             elif selected_player == 'Syncplay':
                 return self._play_syncplay(
@@ -393,6 +403,8 @@ class PlayerManager:
                     start_time=start_time,
                     audio_lang=audio_lang,
                     headers=headers,
+                    subtitle_url=subtitle_url,
+                    audio_url=audio_url,
                 )
             elif selected_player == 'VLC':
                 return self._play_vlc(
@@ -402,6 +414,8 @@ class PlayerManager:
                     start_time=start_time,
                     audio_lang=audio_lang,
                     headers=headers,
+                    subtitle_url=subtitle_url,
+                    audio_url=audio_url,
                 )
             elif selected_player == 'MPC-HC':
                 return self._play_mpc(url, title, available_players['MPC-HC'])
@@ -423,6 +437,8 @@ class PlayerManager:
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        audio_url: Optional[str] = None,
     ) -> dict:
         if not vlc_path:
             vlc_path = self.get_available_players().get('VLC')
@@ -448,6 +464,9 @@ class PlayerManager:
             vlc_args.extend(['--http-referrer', referer])
         if header_map.get('User-Agent'):
             vlc_args.extend(['--http-user-agent', header_map['User-Agent']])
+        slaves = [value for value in (audio_url, subtitle_url) if value]
+        if slaves:
+            vlc_args.append('--input-slave=' + '#'.join(slaves))
             
         vlc_args.append(url)
         
@@ -469,6 +488,8 @@ class PlayerManager:
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        audio_url: Optional[str] = None,
     ) -> dict:
         if not celluloid_path:
             celluloid_path = self.get_available_players().get('Celluloid')
@@ -481,6 +502,10 @@ class PlayerManager:
             args.append(f'--mpv-start={start_time}')
         if audio_lang:
             args.append(f'--mpv-alang={audio_lang}')
+        if subtitle_url:
+            args.append(f'--mpv-sub-file={subtitle_url}')
+        if audio_url:
+            args.append(f'--mpv-audio-file={audio_url}')
 
         ua = None
         ref = referer
@@ -518,6 +543,8 @@ class PlayerManager:
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        audio_url: Optional[str] = None,
     ) -> dict:
         if not iina_path:
             iina_path = self.get_available_players().get('IINA')
@@ -530,6 +557,10 @@ class PlayerManager:
             args.append(f'--mpv-start={start_time}')
         if audio_lang:
             args.append(f'--mpv-alang={audio_lang}')
+        if subtitle_url:
+            args.append(f'--mpv-sub-files={subtitle_url}')
+        if audio_url:
+            args.append(f'--mpv-audio-files={audio_url}')
 
         ua = None
         ref = referer
@@ -567,6 +598,8 @@ class PlayerManager:
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        audio_url: Optional[str] = None,
     ) -> dict:
         if not syncplay_path:
             syncplay_path = self.get_available_players().get('Syncplay')
@@ -579,6 +612,10 @@ class PlayerManager:
             mpv_args.append(f'--start={start_time}')
         if audio_lang:
             mpv_args.append(f'--alang={audio_lang}')
+        if subtitle_url:
+            mpv_args.append(f'--sub-file={subtitle_url}')
+        if audio_url:
+            mpv_args.append(f'--audio-file={audio_url}')
 
         referer = get_stream_referer(url)
         ua = None
@@ -618,6 +655,9 @@ class PlayerManager:
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
+        audio_url: Optional[str] = None,
     ) -> dict:
         if not mpv_path:
             mpv_path = self.get_available_players().get('MPV')
@@ -681,6 +721,12 @@ class PlayerManager:
         # Arabic-first for dubbed Stardima titles; keep the existing Japanese
         # default for providers that do not set an audio preference.
         mpv_args.append(f'--alang={audio_lang or "jpn,ja,eng,en"}')
+        if subtitle_url:
+            mpv_args.append(f'--sub-file={subtitle_url}')
+            if subtitle_lang:
+                mpv_args.append(f'--slang={subtitle_lang},eng,en')
+        if audio_url:
+            mpv_args.append(f'--audio-file={audio_url}')
 
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
         ref = referer

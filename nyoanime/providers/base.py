@@ -15,6 +15,11 @@ class BaseAnimeProvider(ABC):
     id: str = "base"
     name: str = "Base Provider"
     description: str = "Base abstract anime provider"
+    # Language metadata used by the language-mode resolver. Providers that
+    # predate it simply leave these blank and default to Arabic sub.
+    language: str = ""
+    audio_mode: str = "sub"
+    language_mode: str = ""
 
     # Set of supported features. Subclasses can customize this set.
     # Standard feature keys: "search", "latest", "movies", "trending", "popular", "top_rated", "genres", "studios"

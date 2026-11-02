@@ -679,6 +679,7 @@ class UIManager:
                 meta.append(" • ", style=f"dim {palette['border']}")
                 meta.append("by NoBy", style=f"dim {palette['border']}")
             p_display = str(active_provider or "Anime3rb")
+            p_display = p_display.replace(" (English Sub)", " Sub").replace(" (English Dub)", " Dub")
             p_display = p_display.replace(" (English)", "").replace(" Provider", "").strip()
             if p_display and screen_w >= 44:
                 meta.append(" • ", style=f"dim {palette['border']}")
@@ -1139,8 +1140,10 @@ class UIManager:
                 year_b = f"[ {year_text:^4} ]" if year_text else " " * 8
 
                 language = str(getattr(anime, "language", "") or "").lower()
-                lang_text = "DUB" if language == "dub" else ("SUB" if language == "sub" else "")
-                lang_b = f"[ {lang_text:^3} ]" if lang_text else " " * 7
+                lang_text = ""
+                if language in ("sub", "dub"):
+                    lang_text = f"{'EN ' if getattr(api, 'language', '') == 'en' else ''}{language.upper()}"
+                lang_b = f"[ {lang_text} ]" if lang_text else " " * 7
 
                 badges_str = f"{year_b}  {type_b}  {lang_b}  {score_b}"
                 badges_w = cell_len(badges_str)
@@ -1552,6 +1555,9 @@ class UIManager:
                 suffix_w = cell_len(suffix)
 
                 type_str = f" [{ep.type}]" if (ep.type and str(ep.type).lower() != "episode") else ""
+                ep_lang = str(getattr(ep, "language", "") or "").lower()
+                if ep_lang in ("sub", "dub") and getattr(ep, "available_modes", None):
+                    type_str += f" [EN {ep_lang.upper()}]"
                 type_w = cell_len(type_str)
 
                 ep_num_str = f"#{str(ep.display_num).zfill(2)}" if len(episodes) > 9 else f"#{ep.display_num}"
@@ -1636,8 +1642,9 @@ class UIManager:
             language = str(details.get("language") or "").lower()
             if language in ("dub", "sub"):
                 lang_color = COLOR_BOLT if language == "dub" else COLOR_SUBTITLE
+                prefix = "EN " if str(details.get("provider_language") or "") == "en" else ""
                 title_badge.append("   [ ", style=f"bold {lang_color}")
-                title_badge.append(language.upper(), style=f"bold {lang_color}")
+                title_badge.append(prefix + language.upper(), style=f"bold {lang_color}")
                 title_badge.append(" ]", style=f"bold {lang_color}")
 
             content_type = str(details.get("content_type") or "").lower()
@@ -2256,12 +2263,17 @@ class UIManager:
 
     def settings_menu(self, settings_mgr):
         from .providers.manager import ProviderManager
+        from .providers.language import (
+            MODE_CHOICES, language_mode_label, provider_language_mode,
+        )
         prov_list = ProviderManager.list_providers()
         provider_choices = [p["id"] for p in prov_list]
         provider_names = {p["id"]: p["name"] for p in prov_list}
 
         tabs = [
             ("General", [
+                ("Preferred Language", MODE_CHOICES, "language_mode"),
+                ("Auto Provider", [True, False], "auto_provider"),
                 ("Provider", provider_choices, "anime_provider"),
                 ("Default Player", ["mpv", "vlc"], "player"),
                 ("Color Theme", ["auto", "blue", "purple", "cyan", "rose", "sunset", "gold", "mint", "lavender", "pink", "coral", "teal", "magenta", "red", "green"], "theme"),
@@ -2360,6 +2372,8 @@ class UIManager:
                 else:
                     if key_name == "anime_provider":
                         display_str = format_provider_name(current_val)
+                    elif key_name == "language_mode":
+                        display_str = language_mode_label(current_val)
                     else:
                         display_str = str(current_val or "default")
                     
@@ -2506,14 +2520,35 @@ class UIManager:
                                 
                             settings_mgr.set(key_name, new_val)
                             
-                            disp_new = format_provider_name(new_val) if key_name == "anime_provider" else ("ON" if new_val is True else ("OFF" if new_val is False else str(new_val)))
-                            last_notification = f"✔ Set {label} → {disp_new}"
-                            last_notification_time = time.time()
-                            
                             if key_name == "anime_provider":
                                 provider_changed = True
-                                from .providers import ProviderManager
+                                settings_mgr.set("language_mode", provider_language_mode(new_val))
+                                settings_mgr.set("auto_provider", False)
                                 ProviderManager.set_active_provider(new_val)
+                            elif key_name == "language_mode":
+                                provider_changed = True
+                                resolved = ProviderManager.resolve_active_provider(
+                                    settings_mgr,
+                                    mode=new_val,
+                                    preferred_provider=settings_mgr.get("anime_provider"),
+                                    auto=True,
+                                )
+                                settings_mgr.set("anime_provider", resolved)
+                                ProviderManager.set_active_provider(resolved)
+                            elif key_name == "auto_provider" and new_val:
+                                provider_changed = True
+                                resolved = ProviderManager.resolve_active_provider(settings_mgr, auto=True)
+                                settings_mgr.set("anime_provider", resolved)
+                                ProviderManager.set_active_provider(resolved)
+
+                            if key_name == "anime_provider":
+                                disp_new = format_provider_name(new_val)
+                            elif key_name == "language_mode":
+                                disp_new = language_mode_label(new_val)
+                            else:
+                                disp_new = "ON" if new_val is True else ("OFF" if new_val is False else str(new_val))
+                            last_notification = f"✔ Set {label} → {disp_new}"
+                            last_notification_time = time.time()
                             
                             if key_name == "debug_logging":
                                 if new_val:
@@ -2602,11 +2637,21 @@ class UIManager:
                         self.clear()
                         return {"theme_changed": theme_changed, "rpc_changed": rpc_changed, "provider_changed": provider_changed}
 
-    def quality_selection_menu(self, anime_title, episode_num, available_qualities, rpc_manager=None, anime_poster=None):
+    def quality_selection_menu(
+        self,
+        anime_title,
+        episode_num,
+        available_qualities,
+        rpc_manager=None,
+        anime_poster=None,
+        subtitle_options=None,
+        subtitle_index=0,
+    ):
         if rpc_manager:
             rpc_manager.update_choosing_quality(anime_title, episode_num, anime_poster)
         
         selected = 0
+        subtitle_options = subtitle_options or []
         
         def generate_renderable():
             content = Text()
@@ -2629,6 +2674,17 @@ class UIManager:
                     content.append("\n")
                 else:
                     content.append(f"{line_str}\n", style="bold white")
+
+            if subtitle_options:
+                content.append("\n", style="white")
+                if subtitle_index < len(subtitle_options):
+                    track = subtitle_options[subtitle_index]
+                    subtitle_label = track.get("label") or track.get("lang") or "Track"
+                    subtitle_state = f"Subtitle: {subtitle_label}"
+                else:
+                    subtitle_state = "Subtitle: Off"
+                content.append(f"   {subtitle_state}", style=f"bold {COLOR_SUBTITLE}")
+                content.append("  [s] change", style="dim white")
             
             panel = Panel(
                 content,
@@ -2653,7 +2709,10 @@ class UIManager:
 
             # Clean Keycaps Dock
             dock = Text()
-            items = [("↵", "watch", COLOR_TITLE), ("d", "download", COLOR_TITLE), ("b", "back", COLOR_ACCENT)]
+            items = [("↵", "watch", COLOR_TITLE), ("d", "download", COLOR_TITLE)]
+            if subtitle_options:
+                items.append(("s", "subtitles", COLOR_TITLE))
+            items.append(("b", "back", COLOR_ACCENT))
             for idx, (k, flabel, fg) in enumerate(items):
                 if k == "↵":
                     dock.append("↵", style=f"bold {fg}")
@@ -2693,6 +2752,8 @@ class UIManager:
                         return (selected, 'watch')
                     elif key == 'd' or key == 'D':
                         return (selected, 'download')
+                    elif (key == 's' or key == 'S') and subtitle_options:
+                        return (selected, 'subtitle')
                     elif key in ('b', 'B', 'q', 'Q', 'ESC', 'LEFT'):
                         return None
 
