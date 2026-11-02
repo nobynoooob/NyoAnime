@@ -578,7 +578,8 @@ class HiAnimeProvider(BaseAnimeProvider):
             subtitle_lang = chosen.get("lang", "")
 
         master_text = self._get_text(master, referer=embed_origin)
-        variants, audio_url = self._parse_master(master, master_text)
+        variants, _embedded_audio_url = self._parse_master(master, master_text)
+        audio_tracks = self._parse_audio_renditions(master, master_text)
 
         headers = {
             "Referer": embed_origin,
@@ -586,6 +587,17 @@ class HiAnimeProvider(BaseAnimeProvider):
             "User-Agent": _DEFAULT_UA,
         }
         audio_lang = "jpn,ja" if self.MODE == "sub" else "eng,en"
+        if self.MODE == "dub" and audio_tracks:
+            preferred = next(
+                (
+                    track
+                    for track in audio_tracks
+                    if str(track.get("lang") or "").lower().startswith("en")
+                ),
+                None,
+            )
+            if preferred and preferred.get("lang"):
+                audio_lang = f"{preferred['lang']},en"
 
         qualities: List[QualityOption] = []
         for height, bandwidth, url in variants:
@@ -603,7 +615,11 @@ class HiAnimeProvider(BaseAnimeProvider):
                     subtitle_url=subtitle_url,
                     subtitle_lang=subtitle_lang,
                     subtitles=subtitles if self.MODE == "sub" else [],
-                    audio_url=audio_url,
+                    # HLS audio renditions are selected in-stream via --alang,
+                    # never as a separate --audio-file.
+                    audio_tracks=list(audio_tracks),
+                    master_url=master,
+                    bandwidth=int(bandwidth or 0),
                 )
             )
 
@@ -621,7 +637,8 @@ class HiAnimeProvider(BaseAnimeProvider):
                     subtitle_url=subtitle_url,
                     subtitle_lang=subtitle_lang,
                     subtitles=subtitles if self.MODE == "sub" else [],
-                    audio_url=audio_url,
+                    audio_tracks=list(audio_tracks),
+                    master_url=master,
                 )
             )
 
@@ -629,7 +646,7 @@ class HiAnimeProvider(BaseAnimeProvider):
             "CurrentEpisode": {"zoko": qualities[0].direct_url},
             "Qualities": qualities,
             "Subtitles": subtitles if self.MODE == "sub" else [],
-            "Audio": audio_url,
+            "AudioTracks": audio_tracks,
             "Mode": self.MODE,
         }
 
@@ -723,6 +740,45 @@ class HiAnimeProvider(BaseAnimeProvider):
             index += 1
         variants.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return variants, audio_url
+
+    @staticmethod
+    def _parse_audio_renditions(master: str, playlist: str) -> List[Dict[str, Any]]:
+        """Return HLS audio renditions declared by EXT-X-MEDIA, in master order."""
+        renditions: List[Dict[str, Any]] = []
+        seen = set()
+        for raw_line in (playlist or "").splitlines():
+            line = raw_line.strip()
+            if not line.startswith("#EXT-X-MEDIA:"):
+                continue
+            payload = line.split(":", 1)[1]
+            attrs: Dict[str, str] = {}
+            for match in re.finditer(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', payload):
+                value = match.group(2).strip()
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                attrs[match.group(1).upper()] = value
+            if attrs.get("TYPE", "").upper() != "AUDIO":
+                continue
+            uri = attrs.get("URI", "").strip()
+            if not uri:
+                continue
+            lang = attrs.get("LANGUAGE", "").strip()
+            label = attrs.get("NAME", "").strip() or lang
+            key = (lang, label, uri)
+            if key in seen:
+                continue
+            seen.add(key)
+            renditions.append(
+                {
+                    "lang": lang,
+                    "label": label,
+                    "group": attrs.get("GROUP-ID", "").strip(),
+                    "src": urljoin(master, uri),
+                    "default": attrs.get("DEFAULT", "").upper() == "YES",
+                    "autoselect": attrs.get("AUTOSELECT", "").upper() == "YES",
+                }
+            )
+        return renditions
 
     def get_episode_streams(self, episode: Episode) -> List[QualityOption]:
         anime_id = getattr(episode, "anime_id", "") or _slug(getattr(episode, "url", ""))

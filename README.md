@@ -41,6 +41,7 @@
 
 - **Multi-provider engine** — Anime3rb, Anime Slayer, Animeify, HiAnime, Stardima, and Stardima Kids.
 - **Native chunked downloader** — parallel ranges, pause/resume, live speed and ETA. No `aria2c` or `yt-dlp` required.
+- **Native HLS support** — variant selection, AES-128, init segments, resumable segments, and subtitle sidecars without external downloaders.
 - **Lightweight interactive mode (`-i`)** — an `fzf`-driven search flow with Arabic RTL handling.
 - **Multiple players** — MPV, VLC, Celluloid, IINA, and Syncplay. MPV IPC keeps exact-second resume positions.
 - **Smart Arabic search** — normalization for hamza, taa marbuta, and Latinized titles.

@@ -246,7 +246,13 @@ class TestStreamResolution:
         assert qualities[0].direct_url.endswith("/1080/index.m3u8")
         assert qualities[0].subtitle_url == "https://hls.example/en.vtt"
         assert qualities[0].subtitle_lang == "en"
-        assert qualities[0].audio_url == "https://hls.example/audio/en.m3u8"
+        # HLS audio is an in-stream rendition, not an external --audio-file.
+        assert qualities[0].audio_url == ""
+        assert qualities[0].audio_tracks[0]["lang"] == ""
+        assert qualities[0].audio_tracks[0]["label"] == "English"
+        assert qualities[0].audio_tracks[0]["src"] == "https://hls.example/audio/en.m3u8"
+        assert qualities[0].master_url == MASTER_URL
+        assert data["AudioTracks"][0]["default"] is True
         assert qualities[0].headers["Referer"] == "https://zokoanime.video/"
         assert qualities[0].audio_lang == "jpn,ja"
 

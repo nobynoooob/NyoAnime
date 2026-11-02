@@ -33,6 +33,7 @@ from .utils import (
 )
 from .logger import logger
 from .history import format_seconds
+from .providers.language import language_badge
 from . import config as config_module
 
 def _blend_hex(a: str, b: str, t: float) -> str:
@@ -531,6 +532,7 @@ class UIManager:
 
         app_nav = [
             {"key": "l", "label": "history", "action": "history"},
+            {"key": "d", "label": "downloads", "action": "downloads"},
             {"key": "f", "label": "favorites", "action": "favorites"},
             {"key": "c", "label": "settings", "action": "settings"},
         ]
@@ -2024,9 +2026,12 @@ class UIManager:
                     prog_style = f"dim {c_sub}"
 
                 title_cell = Text()
+                badge = language_badge(item.get('language_mode')) if item.get('language_mode') else ""
                 if is_selected:
                     title_cell.append("▶ ", style=f"bold {c_hl_fg}")
                     title_cell.append(raw_title, style=f"bold {c_hl_fg}")
+                    if badge:
+                        title_cell.append(f" [{badge}]", style=f"dim {c_hl_fg}")
                     
                     ep_cell = Text(ep_badge, style=f"bold {c_hl_fg}")
                     prog_cell = Text(prog_badge, style=f"bold {c_hl_fg}")
@@ -2042,6 +2047,8 @@ class UIManager:
                 else:
                     title_cell.append("  ", style="white")
                     title_cell.append(raw_title, style="white")
+                    if badge:
+                        title_cell.append(f" [{badge}]", style=f"dim {c_sub}")
                     
                     ep_cell = Text(ep_badge, style=f"bold {c_sub}")
                     prog_cell = Text(prog_badge, style=prog_style)
@@ -2637,6 +2644,104 @@ class UIManager:
                         self.clear()
                         return {"theme_changed": theme_changed, "rpc_changed": rpc_changed, "provider_changed": provider_changed}
 
+    def track_selection_menu(
+        self,
+        anime_title,
+        episode_num,
+        options,
+        selected_index=0,
+        kind="Subtitle",
+        allow_off=False,
+    ):
+        """Select a real subtitle/audio track. Returns the index, Off index, or None."""
+        options = list(options or [])
+        entries = []
+        for track in options:
+            label = str(track.get("label") or track.get("lang") or "Track")
+            lang = str(track.get("lang") or "").strip()
+            if lang and lang.lower() not in label.lower():
+                label = f"{label} [{lang}]"
+            entries.append(label)
+        if allow_off:
+            entries.append("Off")
+
+        if not entries:
+            return None
+
+        selected = max(0, min(int(selected_index or 0), len(entries) - 1))
+        title = f"Select {kind} Track"
+
+        def generate_renderable():
+            content = Text()
+            width = max((cell_len(entry) for entry in entries), default=16)
+            box_width = min(56, max(38, width + 14))
+            inner_w = box_width - 6
+            for idx, label in enumerate(entries):
+                is_selected = idx == selected
+                prefix = " ▸ " if is_selected else "   "
+                line_str = f"{prefix}{idx + 1}. {label}"
+                pad = " " * max(0, inner_w - cell_len(line_str))
+                if is_selected:
+                    row_text = Text(line_str + pad)
+                    row_text.stylize(f"bold {COLOR_HIGHLIGHT_FG} on {COLOR_BORDER}")
+                    content.append_text(row_text)
+                    content.append("\n")
+                else:
+                    content.append(f"{line_str}{pad}\n", style="bold white")
+
+            panel = Panel(
+                content,
+                title=f"[bold {COLOR_TITLE}]{title}[/bold {COLOR_TITLE}]",
+                box=HEAVY,
+                padding=(1, 2),
+                border_style=COLOR_BORDER,
+                width=box_width,
+            )
+
+            dock = Text()
+            items = [("↵", "select", COLOR_TITLE), ("1-9", "jump", COLOR_TITLE)]
+            items.append(("b", "back", COLOR_ACCENT))
+            for idx, (key, label, fg) in enumerate(items):
+                if key == "↵":
+                    dock.append("↵", style=f"bold {fg}")
+                    dock.append(f" {label}", style="white")
+                else:
+                    dock.append("[", style=f"bold {COLOR_BORDER}")
+                    dock.append(key, style=f"bold {fg}")
+                    dock.append("]", style=f"bold {COLOR_BORDER}")
+                    dock.append(f" {label}", style="white")
+                if idx < len(items) - 1:
+                    dock.append("   •   ", style=f"bold {COLOR_BORDER}")
+
+            root = Table.grid(expand=False)
+            root.add_column(justify="center")
+            root.add_row(Align.center(Text(f"{ar(anime_title)} • Ep {episode_num}", style="bold white")))
+            root.add_row(Text(""))
+            root.add_row(Align.center(panel))
+            root.add_row(Text(""))
+            root.add_row(Align.center(dock))
+            return Align.center(root, vertical="middle", height=self.console.height)
+
+        self.clear()
+        with RawTerminal():
+            with Live(generate_renderable(), console=self.console, auto_refresh=False, screen=True, refresh_per_second=10) as live:
+                while True:
+                    key = get_key()
+                    if (key == 'UP' or key == 'k') and selected > 0:
+                        selected -= 1
+                        live.update(generate_renderable(), refresh=True)
+                    elif (key == 'DOWN' or key == 'j') and selected < len(entries) - 1:
+                        selected += 1
+                        live.update(generate_renderable(), refresh=True)
+                    elif key == 'ENTER':
+                        return selected
+                    elif key and key.isdigit():
+                        idx = int(key) - 1
+                        if 0 <= idx < len(entries):
+                            return idx
+                    elif key in ('b', 'B', 'q', 'Q', 'ESC', 'LEFT'):
+                        return None
+
     def quality_selection_menu(
         self,
         anime_title,
@@ -2646,12 +2751,15 @@ class UIManager:
         anime_poster=None,
         subtitle_options=None,
         subtitle_index=0,
+        audio_options=None,
+        audio_index=0,
     ):
         if rpc_manager:
             rpc_manager.update_choosing_quality(anime_title, episode_num, anime_poster)
         
         selected = 0
         subtitle_options = subtitle_options or []
+        audio_options = audio_options or []
         
         def generate_renderable():
             content = Text()
@@ -2680,11 +2788,21 @@ class UIManager:
                 if subtitle_index < len(subtitle_options):
                     track = subtitle_options[subtitle_index]
                     subtitle_label = track.get("label") or track.get("lang") or "Track"
-                    subtitle_state = f"Subtitle: {subtitle_label}"
+                    subtitle_state = f"Subtitle {subtitle_index + 1}/{len(subtitle_options)}: {subtitle_label}"
                 else:
                     subtitle_state = "Subtitle: Off"
                 content.append(f"   {subtitle_state}", style=f"bold {COLOR_SUBTITLE}")
                 content.append("  [s] change", style="dim white")
+            if audio_options:
+                content.append("\n", style="white")
+                if audio_index < len(audio_options):
+                    track = audio_options[audio_index]
+                    audio_label = track.get("label") or track.get("lang") or "Track"
+                    audio_state = f"Audio {audio_index + 1}/{len(audio_options)}: {audio_label}"
+                else:
+                    audio_state = "Audio: Source default"
+                content.append(f"   {audio_state}", style=f"bold {COLOR_SUBTITLE}")
+                content.append("  [a] change", style="dim white")
             
             panel = Panel(
                 content,
@@ -2712,6 +2830,8 @@ class UIManager:
             items = [("↵", "watch", COLOR_TITLE), ("d", "download", COLOR_TITLE)]
             if subtitle_options:
                 items.append(("s", "subtitles", COLOR_TITLE))
+            if audio_options:
+                items.append(("a", "audio", COLOR_TITLE))
             items.append(("b", "back", COLOR_ACCENT))
             for idx, (k, flabel, fg) in enumerate(items):
                 if k == "↵":
@@ -2754,6 +2874,8 @@ class UIManager:
                         return (selected, 'download')
                     elif (key == 's' or key == 'S') and subtitle_options:
                         return (selected, 'subtitle')
+                    elif (key == 'a' or key == 'A') and audio_options:
+                        return (selected, 'audio')
                     elif key in ('b', 'B', 'q', 'Q', 'ESC', 'LEFT'):
                         return None
 

@@ -197,6 +197,76 @@ class TestNativeDownloader:
         assert sanitize_filename('Naruto: Shippuuden / Ep <1>.mp4') == 'Naruto_ Shippuuden _ Ep _1_.mp4'
         assert sanitize_filename('') == 'download.mp4'
 
+    def test_completed_downloads_listing_and_removal(self):
+        from nyoanime.downloader import (
+            list_completed_downloads,
+            remove_completed_download,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            video = base / "Show - Ep 1 [1080p].mp4"
+            video.write_bytes(b"video")
+            (base / "Show - Ep 1 [1080p].en.vtt").write_text("WEBVTT")
+            (base / "Show - Ep 1 [1080p].ar.srt").write_text("1")
+            (base / "Show - Ep 2 [1080p].mp4").write_bytes(b"partial")
+            (base / "Show - Ep 2 [1080p].mp4.part").write_bytes(b"x")
+
+            items = list_completed_downloads(base)
+            assert [item["name"] for item in items] == [video.name]
+            assert items[0]["size"] == 5
+            assert len(items[0]["subtitles"]) == 2
+
+            assert remove_completed_download(video) is True
+            assert not video.exists()
+            assert not (base / "Show - Ep 1 [1080p].en.vtt").exists()
+            assert not (base / "Show - Ep 1 [1080p].ar.srt").exists()
+            # The partial episode is untouched.
+            assert (base / "Show - Ep 2 [1080p].mp4.part").exists()
+
+    def test_single_download_skips_only_the_same_quality(self):
+        from unittest.mock import MagicMock
+        from rich.console import Console
+        from nyoanime.downloader import DownloadConfig, download_single_episode
+        from nyoanime.models import AnimeResult, Episode
+
+        anime = AnimeResult(id="show", title_en="Show")
+        ep = Episode(number="1", display_num=1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            existing = base / "Show - Ep 1 [1080p].mp4"
+            existing.write_bytes(b"video")
+            console = Console(file=open(base / "console.log", "w", encoding="utf-8"), width=120)
+            try:
+                api = MagicMock()
+                result = download_single_episode(
+                    api,
+                    anime,
+                    ep,
+                    DownloadConfig(save_dir=base, quality="1080p"),
+                    console,
+                    show_progress=False,
+                )
+                assert result["skipped"] is True
+                assert result["path"] == existing
+                api.get_streaming_servers.assert_not_called()
+
+                # A different requested quality must not be silently skipped.
+                api2 = MagicMock()
+                api2.get_streaming_servers.return_value = None
+                result = download_single_episode(
+                    api2,
+                    anime,
+                    ep,
+                    DownloadConfig(save_dir=base, quality="480p"),
+                    console,
+                    show_progress=False,
+                )
+                assert result["success"] is False
+                api2.get_streaming_servers.assert_called_once()
+            finally:
+                console.file.close()
+
     def test_stream_downloader_resumable_logic(self):
         from unittest.mock import patch, MagicMock
         from nyoanime.downloader import StreamDownloader

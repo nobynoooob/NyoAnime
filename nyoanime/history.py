@@ -124,6 +124,7 @@ class HistoryManager:
         completed = bool(raw.get('completed', False)) or (percent >= 90)
         poster_url = str(raw.get('poster_url') or '')
         provider = str(raw.get('provider') or '')
+        language_mode = str(raw.get('language_mode') or '')
         last_updated = str(raw.get('last_updated') or datetime.now().isoformat())
 
         raw_eps_prog = raw.get('episodes_progress')
@@ -163,9 +164,32 @@ class HistoryManager:
             'completed': completed,
             'poster_url': poster_url,
             'provider': provider,
+            'language_mode': language_mode,
             'last_updated': last_updated,
             'episodes_progress': episodes_prog
         }
+
+    def _entry_key(self, anime_id, provider: str = "") -> str:
+        """Return the storage key for an anime, preserving legacy bare ids.
+
+        Providers share slugs (e.g. ``naruto`` exists on Arabic and English
+        sources), so a provider-qualified key is only introduced once a bare
+        key is already owned by a different provider.  Existing history is
+        therefore never migrated or lost.
+        """
+        base = str(anime_id)
+        provider = str(provider or "")
+        entry = self.history.get(base)
+        if isinstance(entry, dict):
+            owner = str(entry.get('provider') or '')
+            if not provider or not owner or owner == provider:
+                return base
+            return f"{provider}:{base}"
+        if provider:
+            composite = f"{provider}:{base}"
+            if isinstance(self.history.get(composite), dict):
+                return composite
+        return base
 
     def save_history(self):
         try:
@@ -181,8 +205,8 @@ class HistoryManager:
         except Exception as e:
             print(f"Warning: Failed to save history: {e}", file=sys.stderr)
 
-    def mark_watched(self, anime_id, episode_num, anime_title, time_pos: float = 0.0, duration: float = 0.0, percent: float = 0.0, poster_url: str = "", provider: str = ""):
-        anime_id_str = str(anime_id)
+    def mark_watched(self, anime_id, episode_num, anime_title, time_pos: float = 0.0, duration: float = 0.0, percent: float = 0.0, poster_url: str = "", provider: str = "", language_mode: str = ""):
+        anime_id_str = self._entry_key(anime_id, provider)
         ep_num_str = str(episode_num)
 
         try:
@@ -231,20 +255,21 @@ class HistoryManager:
             'completed': completed,
             'poster_url': str(poster_url or entry.get('poster_url', '')),
             'provider': str(provider or entry.get('provider', '')),
+            'language_mode': str(language_mode or entry.get('language_mode', '')),
             'last_updated': now_iso,
             'episodes_progress': episodes_prog
         }
         self.save_history()
 
-    def get_last_watched(self, anime_id) -> Optional[str]:
-        data = self.history.get(str(anime_id))
+    def get_last_watched(self, anime_id, provider: str = "") -> Optional[str]:
+        data = self.history.get(self._entry_key(anime_id, provider))
         if isinstance(data, dict):
             ep = data.get('episode')
             return str(ep) if ep is not None else None
         return None
 
-    def get_episode_progress(self, anime_id, episode_num) -> dict:
-        data = self.history.get(str(anime_id), {})
+    def get_episode_progress(self, anime_id, episode_num, provider: str = "") -> dict:
+        data = self.history.get(self._entry_key(anime_id, provider), {})
         if not isinstance(data, dict):
             return {'time_pos': 0.0, 'duration': 0.0, 'percent': 0, 'completed': False, 'time_str': '00:00'}
 
@@ -267,8 +292,8 @@ class HistoryManager:
             }
         return {'time_pos': 0.0, 'duration': 0.0, 'percent': 0, 'completed': False, 'time_str': '00:00'}
 
-    def get_all_episodes_progress(self, anime_id) -> dict:
-        data = self.history.get(str(anime_id), {})
+    def get_all_episodes_progress(self, anime_id, provider: str = "") -> dict:
+        data = self.history.get(self._entry_key(anime_id, provider), {})
         if not isinstance(data, dict):
             return {}
 
@@ -295,8 +320,8 @@ class HistoryManager:
                 }
         return result
 
-    def remove(self, anime_id):
-        aid = str(anime_id)
+    def remove(self, anime_id, provider: str = ""):
+        aid = self._entry_key(anime_id, provider)
         if aid in self.history:
             del self.history[aid]
             self.save_history()
@@ -324,7 +349,9 @@ class HistoryManager:
                 'completed': completed,
                 'time_str': format_seconds(time_pos),
                 'duration_str': format_seconds(duration),
-                'last_updated': str(data.get('last_updated') or '')
+                'last_updated': str(data.get('last_updated') or ''),
+                'provider': str(data.get('provider') or ''),
+                'language_mode': str(data.get('language_mode') or ''),
             })
         items.sort(key=lambda x: x['last_updated'], reverse=True)
         return items

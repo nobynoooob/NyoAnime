@@ -309,9 +309,17 @@ class PlayerManager:
         subtitle_url: Optional[str] = None,
         subtitle_lang: Optional[str] = None,
         audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
+        hls_bitrate: Optional[int] = None,
     ) -> dict:
         available_players = self.get_available_players()
-        default_result = {'time_pos': 0.0, 'duration': 0.0, 'percent': 0.0, 'completed': False}
+        default_result = {
+            'time_pos': 0.0,
+            'duration': 0.0,
+            'percent': 0.0,
+            'completed': False,
+            'position_reported': False,
+        }
         
         if not available_players:
             msg = "No video players found on your computer. Please download and install MPV or VLC Media Player."
@@ -372,6 +380,8 @@ class PlayerManager:
                     subtitle_url=subtitle_url,
                     subtitle_lang=subtitle_lang,
                     audio_url=audio_url,
+                    subtitles_disabled=subtitles_disabled,
+                    hls_bitrate=hls_bitrate,
                 )
             elif selected_player == 'Celluloid':
                 return self._play_celluloid(
@@ -382,7 +392,9 @@ class PlayerManager:
                     audio_lang=audio_lang,
                     headers=headers,
                     subtitle_url=subtitle_url,
+                    subtitle_lang=subtitle_lang,
                     audio_url=audio_url,
+                    subtitles_disabled=subtitles_disabled,
                 )
             elif selected_player == 'IINA':
                 return self._play_iina(
@@ -393,7 +405,9 @@ class PlayerManager:
                     audio_lang=audio_lang,
                     headers=headers,
                     subtitle_url=subtitle_url,
+                    subtitle_lang=subtitle_lang,
                     audio_url=audio_url,
+                    subtitles_disabled=subtitles_disabled,
                 )
             elif selected_player == 'Syncplay':
                 return self._play_syncplay(
@@ -404,7 +418,9 @@ class PlayerManager:
                     audio_lang=audio_lang,
                     headers=headers,
                     subtitle_url=subtitle_url,
+                    subtitle_lang=subtitle_lang,
                     audio_url=audio_url,
+                    subtitles_disabled=subtitles_disabled,
                 )
             elif selected_player == 'VLC':
                 return self._play_vlc(
@@ -415,7 +431,9 @@ class PlayerManager:
                     audio_lang=audio_lang,
                     headers=headers,
                     subtitle_url=subtitle_url,
+                    subtitle_lang=subtitle_lang,
                     audio_url=audio_url,
+                    subtitles_disabled=subtitles_disabled,
                 )
             elif selected_player == 'MPC-HC':
                 return self._play_mpc(url, title, available_players['MPC-HC'])
@@ -438,7 +456,9 @@ class PlayerManager:
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
         audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
     ) -> dict:
         if not vlc_path:
             vlc_path = self.get_available_players().get('VLC')
@@ -453,32 +473,47 @@ class PlayerManager:
             '--fullscreen',
             '--play-and-exit',
             '--meta-title', title,
+            # Sidecar subtitles are passed explicitly via --input-slave.
+            '--no-sub-autodetect-file',
         ]
         if start_time and start_time > 0:
             vlc_args.append(f'--start-time={int(start_time)}')
         if audio_lang:
-            vlc_args.append(f'--audio-language={audio_lang}')
+            # VLC matches a single language token reliably; "eng,en" is not a list.
+            vlc_args.append(f'--audio-language={audio_lang.split(",")[0].strip()}')
         if header_map.get('Referer'):
             vlc_args.extend(['--http-referrer', header_map['Referer']])
         elif referer:
             vlc_args.extend(['--http-referrer', referer])
         if header_map.get('User-Agent'):
             vlc_args.extend(['--http-user-agent', header_map['User-Agent']])
-        slaves = [value for value in (audio_url, subtitle_url) if value]
+        # VLC 3 has no generic extra-header option, so Origin/X-* cannot be
+        # forwarded here. Playback still works for the providers that only
+        # check Referer/User-Agent.
+        if subtitles_disabled:
+            vlc_args.append('--sub-track=-1')
+        elif subtitle_url and subtitle_lang:
+            vlc_args.append(f'--sub-language={subtitle_lang.split(",")[0].strip()}')
+        slaves = [value for value in (audio_url, None if subtitles_disabled else subtitle_url) if value]
         if slaves:
             vlc_args.append('--input-slave=' + '#'.join(slaves))
             
         vlc_args.append(url)
         
-        t_start = time.time()
         subprocess.run(
             vlc_args,
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        elapsed = time.time() - t_start
-        return {'time_pos': start_time + elapsed, 'duration': 0.0, 'percent': 0.0, 'completed': False}
+        # VLC's CLI cannot report the final playback position.
+        return {
+            'time_pos': 0.0,
+            'duration': 0.0,
+            'percent': 0.0,
+            'completed': False,
+            'position_reported': False,
+        }
 
     def _play_celluloid(
         self,
@@ -489,7 +524,9 @@ class PlayerManager:
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
         audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
     ) -> dict:
         if not celluloid_path:
             celluloid_path = self.get_available_players().get('Celluloid')
@@ -498,12 +535,18 @@ class PlayerManager:
 
         referer = get_stream_referer(url)
         args = [celluloid_path]
+        args.append('--mpv-sub-auto=no')
         if start_time and start_time > 0:
             args.append(f'--mpv-start={start_time}')
         if audio_lang:
             args.append(f'--mpv-alang={audio_lang}')
-        if subtitle_url:
+        if subtitles_disabled:
+            args.append('--mpv-sid=no')
+            args.append('--mpv-sub-auto=no')
+        elif subtitle_url:
             args.append(f'--mpv-sub-file={subtitle_url}')
+            if subtitle_lang:
+                args.append(f'--mpv-slang={subtitle_lang}')
         if audio_url:
             args.append(f'--mpv-audio-file={audio_url}')
 
@@ -530,10 +573,14 @@ class PlayerManager:
 
         args.append(url)
         
-        t_start = time.time()
         subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elapsed = time.time() - t_start
-        return {'time_pos': start_time + elapsed, 'duration': 0.0, 'percent': 0.0, 'completed': False}
+        return {
+            'time_pos': 0.0,
+            'duration': 0.0,
+            'percent': 0.0,
+            'completed': False,
+            'position_reported': False,
+        }
 
     def _play_iina(
         self,
@@ -544,7 +591,9 @@ class PlayerManager:
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
         audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
     ) -> dict:
         if not iina_path:
             iina_path = self.get_available_players().get('IINA')
@@ -552,13 +601,18 @@ class PlayerManager:
             raise FileNotFoundError("IINA not found")
 
         referer = get_stream_referer(url)
-        args = [iina_path, '--keep-running']
+        args = [iina_path, '--keep-running', '--mpv-sub-auto=no']
         if start_time and start_time > 0:
             args.append(f'--mpv-start={start_time}')
         if audio_lang:
             args.append(f'--mpv-alang={audio_lang}')
-        if subtitle_url:
+        if subtitles_disabled:
+            args.append('--mpv-sid=no')
+            args.append('--mpv-sub-auto=no')
+        elif subtitle_url:
             args.append(f'--mpv-sub-files={subtitle_url}')
+            if subtitle_lang:
+                args.append(f'--mpv-slang={subtitle_lang}')
         if audio_url:
             args.append(f'--mpv-audio-files={audio_url}')
 
@@ -585,10 +639,14 @@ class PlayerManager:
 
         args.append(url)
         
-        t_start = time.time()
         subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elapsed = time.time() - t_start
-        return {'time_pos': start_time + elapsed, 'duration': 0.0, 'percent': 0.0, 'completed': False}
+        return {
+            'time_pos': 0.0,
+            'duration': 0.0,
+            'percent': 0.0,
+            'completed': False,
+            'position_reported': False,
+        }
 
     def _play_syncplay(
         self,
@@ -599,7 +657,9 @@ class PlayerManager:
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
         audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
     ) -> dict:
         if not syncplay_path:
             syncplay_path = self.get_available_players().get('Syncplay')
@@ -607,13 +667,18 @@ class PlayerManager:
             raise FileNotFoundError("Syncplay not found")
 
         args = [syncplay_path, url]
-        mpv_args = []
+        mpv_args = ['--sub-auto=no']
         if start_time and start_time > 0:
             mpv_args.append(f'--start={start_time}')
         if audio_lang:
             mpv_args.append(f'--alang={audio_lang}')
-        if subtitle_url:
+        if subtitles_disabled:
+            mpv_args.append('--sid=no')
+            mpv_args.append('--sub-auto=no')
+        elif subtitle_url:
             mpv_args.append(f'--sub-file={subtitle_url}')
+            if subtitle_lang:
+                mpv_args.append(f'--slang={subtitle_lang}')
         if audio_url:
             mpv_args.append(f'--audio-file={audio_url}')
 
@@ -642,10 +707,14 @@ class PlayerManager:
         if mpv_args:
             args.extend(['--'] + mpv_args)
 
-        t_start = time.time()
         subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elapsed = time.time() - t_start
-        return {'time_pos': start_time + elapsed, 'duration': 0.0, 'percent': 0.0, 'completed': False}
+        return {
+            'time_pos': 0.0,
+            'duration': 0.0,
+            'percent': 0.0,
+            'completed': False,
+            'position_reported': False,
+        }
 
     def _play_mpv(
         self,
@@ -658,6 +727,8 @@ class PlayerManager:
         subtitle_url: Optional[str] = None,
         subtitle_lang: Optional[str] = None,
         audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
+        hls_bitrate: Optional[int] = None,
     ) -> dict:
         if not mpv_path:
             mpv_path = self.get_available_players().get('MPV')
@@ -705,8 +776,9 @@ class PlayerManager:
             '--hwdec=auto-safe',
             '--vo=gpu',
             '--profile=fast',
-            '--sub-auto=fuzzy',
-            '--slang=ara,ar,eng,en',
+            # Never auto-load an unrelated local subtitle; explicit tracks are
+            # passed with --sub-file and embedded tracks use --slang/--sid.
+            '--sub-auto=no',
             '--really-quiet',
             '--terminal=no',
             '--msg-level=all=no',
@@ -721,10 +793,23 @@ class PlayerManager:
         # Arabic-first for dubbed Stardima titles; keep the existing Japanese
         # default for providers that do not set an audio preference.
         mpv_args.append(f'--alang={audio_lang or "jpn,ja,eng,en"}')
-        if subtitle_url:
+        if hls_bitrate and hls_bitrate > 0:
+            # Pin the variant the user picked when playing a master playlist
+            # (required for in-stream audio rendition selection).
+            mpv_args.append(f'--hls-bitrate={int(hls_bitrate)}')
+        if subtitles_disabled:
+            mpv_args.append('--sid=no')
+            mpv_args.append('--sub-auto=no')
+        elif subtitle_url:
             mpv_args.append(f'--sub-file={subtitle_url}')
             if subtitle_lang:
                 mpv_args.append(f'--slang={subtitle_lang},eng,en')
+        else:
+            # Arabic-first providers keep their previous subtitle preference.
+            default_slang = "ara,ar,eng,en" if (audio_lang or "").lower().startswith("ara") else "eng,en,ara,ar"
+            mpv_args.append(f'--slang={subtitle_lang or default_slang}')
+        # Only a separate external audio track belongs in --audio-file; HLS
+        # renditions are selected in-stream through --alang.
         if audio_url:
             mpv_args.append(f'--audio-file={audio_url}')
 
@@ -788,7 +873,9 @@ class PlayerManager:
                 self.console.print(Text("⚠ Stream closed or unreachable. Select another server if playback failed.", style="bold yellow"))
                 time.sleep(1.0)
 
-        return tracker.state
+        state = dict(tracker.state)
+        state['position_reported'] = True
+        return state
 
     def _play_mpc(self, url: str, title: str, mpc_path: str = None):
         if not mpc_path:
@@ -811,3 +898,10 @@ class PlayerManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+        return {
+            'time_pos': 0.0,
+            'duration': 0.0,
+            'percent': 0.0,
+            'completed': False,
+            'position_reported': False,
+        }

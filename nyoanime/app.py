@@ -13,13 +13,30 @@ from .providers import ProviderManager
 from .player import PlayerManager
 from .discord_rpc import DiscordRPCManager
 from .models import AnimeResult, Episode, QualityOption
-from .utils import download_file, show_cursor, hide_cursor
+from .utils import show_cursor, hide_cursor
 from .history import HistoryManager, format_seconds
 from .settings import SettingsManager
 from .favorites import FavoritesManager
 from .deps import ensure_dependencies
 from .cli import run_simple_cli
-from .downloader import prompt_download_options, execute_batch_download, is_hls_url
+from .downloader import (
+    DownloadConfig,
+    DownloadPlan,
+    download_single_episode,
+    execute_batch_download,
+    list_completed_downloads,
+    parse_speed_limit,
+    prompt_download_options,
+    remove_completed_download,
+    resolve_download_plan,
+)
+from .hls import probe_subtitle_url
+from .providers.language import (
+    mode_audio_lang,
+    normalize_language_mode,
+    provider_language_mode,
+    provider_supports_mode,
+)
 from .logger import logger, install_global_exception_handler
 import shutil
 import argparse
@@ -286,6 +303,10 @@ class NyoAnimeApp:
                 self.handle_favorites()
                 continue
 
+            elif action == "downloads":
+                self.handle_downloads()
+                continue
+
             elif action == "settings":
                 self.rpc.update_settings()
                 self.ui.settings_menu(self.settings)
@@ -547,7 +568,7 @@ class NyoAnimeApp:
             item = history_items[selected_idx]
             
             if action == 'remove':
-                self.history.remove(item['anime_id'])
+                self.history.remove(item['anime_id'], provider=item.get('provider', ''))
                 continue
             elif action == 'resume':
                 self.resume_anime(item, direct_watch=True)
@@ -580,12 +601,23 @@ class NyoAnimeApp:
         return 0
 
     def resume_anime(self, history_item, direct_watch=True):
+        item_provider = str(history_item.get('provider') or '')
+        target_anime_id = str(history_item.get('anime_id') or history_item.get('id') or "")
+        if item_provider:
+            canonical = ProviderManager.get_canonical_id(item_provider)
+            if target_anime_id.startswith(f"{canonical}:"):
+                target_anime_id = target_anime_id.split(":", 1)[1]
+            if canonical and canonical != getattr(self.provider, 'id', ''):
+                # Resume on the provider that actually owns this entry.
+                self.settings.set('anime_provider', canonical)
+                self.settings.set('language_mode', provider_language_mode(canonical))
+                self._sync_active_provider()
+
         results = self.ui.run_with_loading("Resuming...", self.api.search_anime, history_item['title'])
         if not results:
             self.ui.render_message("Error", "Could not find anime details.", "error")
             return
 
-        target_anime_id = str(history_item.get('anime_id') or history_item.get('id') or "")
         selected_anime = None
         for res in results:
             if target_anime_id and str(res.id) == target_anime_id:
@@ -729,6 +761,42 @@ class NyoAnimeApp:
                 except Exception as e:
                     self.ui.render_message("Error", f"Failed to resume anime: {str(e)}", "error")
 
+    def handle_downloads(self):
+        directory = Path(self._get_download_directory()).expanduser()
+        while True:
+            items = list_completed_downloads(directory)
+            if not items:
+                self.ui.render_message(
+                    "Downloads",
+                    f"No completed downloads in {directory}",
+                    "info",
+                )
+                return
+
+            labels = []
+            for item in items:
+                sub_count = len(item["subtitles"])
+                extra = f"  •  {sub_count} subtitle(s)" if sub_count else ""
+                labels.append(f"{item['name']}  ({item['size_label']}){extra}")
+
+            selected = self.ui.selection_menu(labels, "Downloads")
+            if selected is None:
+                return
+
+            target = items[labels.index(selected)]
+            try:
+                answer = self.ui.console.input(
+                    f"[yellow]Delete '{target['name']}'? [y/N]: [/yellow]"
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if answer not in ("y", "yes"):
+                continue
+            if remove_completed_download(target["path"]):
+                self.ui.render_message("Deleted", target["name"], "info")
+            else:
+                self.ui.render_message("Error", f"Could not delete {target['name']}", "error")
+
     def handle_anime_selection(self, results):
         while True:
             anime_idx = self.ui.anime_selection_menu(results, api=self.api)
@@ -786,10 +854,11 @@ class NyoAnimeApp:
 
     def handle_episode_selection(self, selected_anime, episodes, initial_idx=0):
         current_idx = max(0, min(int(initial_idx or 0), len(episodes) - 1))
-        
+        provider_id = getattr(self.provider, 'id', '')
+
         while True:
-            last_watched = self.history.get_last_watched(selected_anime.id)
-            episodes_prog = self.history.get_all_episodes_progress(selected_anime.id)
+            last_watched = self.history.get_last_watched(selected_anime.id, provider=provider_id)
+            episodes_prog = self.history.get_all_episodes_progress(selected_anime.id, provider=provider_id)
             is_fav = self.favorites.is_favorite(selected_anime.id)
             default_download_quality = self._get_default_download_quality()
             download_mode = self._get_download_mode()
@@ -922,99 +991,85 @@ class NyoAnimeApp:
     def _get_download_directory(self):
         return self.settings.get('download_directory') or "downloads"
 
-    def _extract_quality_tag(self, quality_name):
-        quality_match = re.search(r"\b(\d{3,4}p)\b", quality_name or "")
-        return quality_match.group(1) if quality_match else (quality_name or "auto")
+    def _language_mode(self):
+        configured = self.settings.get('language_mode')
+        provider_id = getattr(self.provider, 'id', '')
+        if configured and provider_supports_mode(provider_id, configured):
+            return normalize_language_mode(configured)
+        return provider_language_mode(provider_id) if provider_id else normalize_language_mode(configured)
 
-    def _pick_default_download_quality_option(self, server_data):
-        if isinstance(server_data, dict):
-            qualities = server_data.get('Qualities')
-            if qualities:
-                preferred = self._get_default_download_quality()
-                for q in qualities:
-                    if preferred in (q.res or q.name or ""):
-                        return q
-                return qualities[0]
-            current_ep_data = server_data.get('CurrentEpisode', {})
-        else:
-            current_ep_data = server_data
-
-        qualities = [
-            QualityOption("1080p", 'FRFhdQ', "info"),
-            QualityOption("720p", 'FRLink', "info"),
-            QualityOption("480p", 'FRLowQ', "info"),
-        ]
-
-        preferred_quality = self._get_default_download_quality()
-
-        for quality in qualities:
-            if preferred_quality in quality.name and current_ep_data.get(quality.server_key):
-                return quality
-
-        for quality in qualities:
-            if current_ep_data.get(quality.server_key):
-                return quality
-
-        return None
+    def _download_config(self, quality=None, subtitle_lang=None):
+        speed = parse_speed_limit(self.settings.get('download_speed_limit'))
+        return DownloadConfig(
+            save_dir=Path(self._get_download_directory()).expanduser(),
+            max_parallel=2,
+            speed_limit_bytes=speed,
+            quality=quality or self._get_default_download_quality(),
+            subtitle_lang=subtitle_lang,
+            provider=getattr(self.provider, 'id', ''),
+            language_mode=self._language_mode(),
+        )
 
     def resolve_default_download_target(self, selected_anime, selected_ep, show_loading=False):
+        """Resolve the default-quality :class:`DownloadPlan` for an episode."""
         if show_loading:
-            server_data = self.ui.run_with_loading(
-                "Loading servers...",
-                self.api.get_streaming_servers,
-                selected_anime.id,
-                selected_ep.number,
-                selected_anime.type
-            )
+            with self.ui.console.status("[bold blue]Resolving stream...[/bold blue]"):
+                plan = resolve_download_plan(
+                    self.api,
+                    selected_anime,
+                    selected_ep,
+                    self._get_default_download_quality(),
+                )
         else:
-            server_data = self.api.get_streaming_servers(selected_anime.id, selected_ep.number, selected_anime.type)
-
-        if not server_data:
-            return None, None, None, "No servers found for this episode."
-
-        selected_quality = self._pick_default_download_quality_option(server_data)
-        if not selected_quality:
-            return None, None, None, "No suitable quality found for this episode."
-
-        current_ep_data = server_data.get('CurrentEpisode', {}) if isinstance(server_data, dict) else {}
-        direct_url = selected_quality.direct_url or current_ep_data.get(selected_quality.server_key)
-        if not direct_url or not direct_url.startswith("http"):
-            return None, None, None, "Failed to resolve direct video stream."
-
-        quality_tag = self._extract_quality_tag(selected_quality.name)
-        ext = str(getattr(selected_quality, 'ext', 'mp4') or 'mp4').lstrip('.')
-        filename = f"{selected_anime.title_en} - Ep {selected_ep.display_num} [{quality_tag}].{ext}"
-        headers = getattr(selected_quality, 'headers', None) or None
-        return direct_url, filename, headers, None
+            plan = resolve_download_plan(
+                self.api,
+                selected_anime,
+                selected_ep,
+                self._get_default_download_quality(),
+            )
+        if not plan:
+            return None, "Could not resolve a download link for this episode."
+        return plan, None
 
     def download_episode_with_defaults(self, selected_anime, selected_ep):
-        direct_url, filename, headers, error = self.resolve_default_download_target(selected_anime, selected_ep, show_loading=True)
-
+        plan, error = self.resolve_default_download_target(selected_anime, selected_ep)
         if error:
             self.ui.render_message("✗ Download Error", error, "error")
             return False
 
-        if is_hls_url(direct_url):
-            self.ui.render_message(
-                "Download Unavailable",
-                "This source is an HLS playlist — play it with mpv instead.",
-                "info",
-            )
-            return False
-
-        success = download_file(
-            direct_url,
-            filename,
-            self.ui.console,
-            mode=self._get_download_mode(),
-            download_dir=self._get_download_directory(),
-            headers=headers,
+        result = download_single_episode(
+            api=self.api,
+            anime=selected_anime,
+            ep=selected_ep,
+            config=self._download_config(quality=plan.quality),
+            console=self.ui.console,
+            plan=plan,
         )
 
-        if success:
-            self.history.mark_watched(selected_anime.id, selected_ep.display_num, selected_anime.title_en)
+        return self._finish_single_download(selected_anime, selected_ep, result)
 
-        return success
+    def _finish_single_download(self, selected_anime, selected_ep, result):
+        if not result.get("success"):
+            error = result.get("error") or "Unknown download failure."
+            if error.startswith("cancelled"):
+                self.ui.render_message("Download Paused", error, "info")
+            else:
+                self.ui.render_message("✗ Download Error", error, "error")
+            return False
+
+        if not result.get("skipped"):
+            self.history.mark_watched(
+                selected_anime.id,
+                selected_ep.display_num,
+                selected_anime.title_en,
+                poster_url=getattr(selected_anime, 'thumbnail', ''),
+                provider=getattr(self.provider, 'id', ''),
+                language_mode=self._language_mode(),
+            )
+            subtitle = result.get("subtitle")
+            if subtitle:
+                self.ui.console.print(f"[dim]Subtitle saved: {subtitle}[/dim]")
+        return True
 
     def handle_batch_download(self, selected_anime, episodes):
         selected_indices = self.ui.batch_selection_menu(episodes)
@@ -1034,6 +1089,8 @@ class NyoAnimeApp:
             batch_mode=True
         )
         if config:
+            config.provider = getattr(self.provider, 'id', '')
+            config.language_mode = self._language_mode()
             execute_batch_download(
                 api=self.api,
                 anime=selected_anime,
@@ -1049,6 +1106,83 @@ class NyoAnimeApp:
 
         enter_raw_mode_after_input()
 
+    def _collect_subtitles(self, available):
+        merged = []
+        seen = set()
+        for quality in available:
+            for track in getattr(quality, 'subtitles', None) or []:
+                if not isinstance(track, dict):
+                    continue
+                src = str(track.get('src') or '').strip()
+                if not src.startswith('http') or src in seen:
+                    continue
+                seen.add(src)
+                merged.append(dict(track))
+        return merged
+
+    def _filter_valid_subtitles(self, subtitles, headers=None):
+        """Drop expired/broken subtitle URLs before showing them to the user."""
+        if not subtitles:
+            return []
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _check(track):
+            ok, _reason = probe_subtitle_url(track.get('src', ''), headers=headers, timeout=6.0)
+            return track, ok
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(4, len(subtitles))) as pool:
+                results = list(pool.map(_check, subtitles))
+        except Exception:
+            return subtitles
+        valid = [track for track, ok in results if ok]
+        dropped = len(subtitles) - len(valid)
+        if dropped:
+            logger.debug("SUBTITLE", f"Dropped {dropped} unreachable subtitle track(s)")
+        return valid
+
+    @staticmethod
+    def _collect_audio_tracks(available):
+        merged = []
+        seen = set()
+        for quality in available:
+            for track in getattr(quality, 'audio_tracks', None) or []:
+                if not isinstance(track, dict):
+                    continue
+                key = (
+                    str(track.get('lang') or ''),
+                    str(track.get('label') or ''),
+                    str(track.get('src') or ''),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(dict(track))
+        return merged
+
+    @staticmethod
+    def _audio_lang_for_track(track, fallback=''):
+        lang = str((track or {}).get('lang') or '').strip()
+        if not lang:
+            return fallback
+        short = lang.split('-', 1)[0].lower()
+        return f"{lang},{short}" if short and short != lang.lower() else lang
+
+    @staticmethod
+    def _default_audio_index(audio_tracks, language_mode=''):
+        if not audio_tracks:
+            return None
+        wanted = {'en_sub': 'jpn', 'en_dub': 'eng', 'ar_sub': 'ara'}.get(language_mode, '')
+        if wanted:
+            for idx, track in enumerate(audio_tracks):
+                lang = str(track.get('lang') or '').lower()
+                if lang.startswith(wanted[:2]):
+                    return idx
+        for idx, track in enumerate(audio_tracks):
+            if track.get('default'):
+                return idx
+        return 0
+
     def handle_quality_selection(self, selected_anime, selected_ep, server_data, start_time=None):
         current_ep_data = server_data.get('CurrentEpisode', {})
         available = server_data.get('Qualities')
@@ -1059,28 +1193,37 @@ class NyoAnimeApp:
                 QualityOption("1080p", 'FRFhdQ', "info"),
             ]
             available = [q for q in qualities if current_ep_data.get(q.server_key)]
-        
+
         if not available:
             self.ui.render_message(
-                "✗ No Links", 
-                "No video streams found for this episode.", 
+                "✗ No Links",
+                "No video streams found for this episode.",
                 "error"
             )
             return None
 
-        subtitles = getattr(available[0], 'subtitles', None) or []
-        subtitle_index = 0
+        probe_headers = getattr(available[0], 'headers', None) or None
+        subtitles = self._filter_valid_subtitles(
+            self._collect_subtitles(available), headers=probe_headers
+        )
+        audio_tracks = self._collect_audio_tracks(available)
+        subtitle_choice = 0 if subtitles else None
+        language_mode = self._language_mode()
+        audio_choice = self._default_audio_index(audio_tracks, language_mode)
+
         while True:
             result = self.ui.quality_selection_menu(
-                selected_anime.title_en, 
-                selected_ep.display_num, 
-                available, 
+                selected_anime.title_en,
+                selected_ep.display_num,
+                available,
                 self.rpc,
                 selected_anime.thumbnail,
                 subtitle_options=subtitles,
-                subtitle_index=subtitle_index,
+                subtitle_index=subtitle_choice if subtitle_choice is not None else len(subtitles),
+                audio_options=audio_tracks,
+                audio_index=audio_choice if audio_choice is not None else 0,
             )
-            
+
             if result == -1:
                 sys.exit(0)
             if result is None:
@@ -1088,110 +1231,172 @@ class NyoAnimeApp:
 
             idx, action = result
             if action == 'subtitle' and subtitles:
-                subtitle_index = (subtitle_index + 1) % (len(subtitles) + 1)
+                picked = self.ui.track_selection_menu(
+                    selected_anime.title_en,
+                    selected_ep.display_num,
+                    subtitles,
+                    selected_index=subtitle_choice if subtitle_choice is not None else len(subtitles),
+                    kind="Subtitle",
+                    allow_off=True,
+                )
+                if picked is not None:
+                    subtitle_choice = None if picked >= len(subtitles) else picked
+                continue
+            if action == 'audio' and audio_tracks:
+                picked = self.ui.track_selection_menu(
+                    selected_anime.title_en,
+                    selected_ep.display_num,
+                    audio_tracks,
+                    selected_index=audio_choice or 0,
+                    kind="Audio",
+                )
+                if picked is not None:
+                    audio_choice = picked
                 continue
             break
 
         quality = available[idx]
-        if subtitles:
-            if subtitle_index < len(subtitles):
-                quality.subtitle_url = subtitles[subtitle_index].get('src', '')
-                quality.subtitle_lang = subtitles[subtitle_index].get('lang', '')
-            else:
-                quality.subtitle_url = ''
-                quality.subtitle_lang = ''
-        direct_url = getattr(quality, 'direct_url', '') or getattr(quality, 'url', '') or current_ep_data.get(getattr(quality, 'server_key', ''))
+        chosen_subtitle = subtitles[subtitle_choice] if subtitle_choice is not None and subtitle_choice < len(subtitles) else None
+        subtitle_url = str((chosen_subtitle or {}).get('src') or '')
+        subtitle_lang = str((chosen_subtitle or {}).get('lang') or '')
+        direct_url = (
+            getattr(quality, 'direct_url', '')
+            or getattr(quality, 'url', '')
+            or current_ep_data.get(getattr(quality, 'server_key', ''))
+        )
 
         audio_lang = getattr(quality, 'audio_lang', '') or ''
+        if audio_tracks and audio_choice is not None and audio_choice < len(audio_tracks):
+            audio_lang = self._audio_lang_for_track(audio_tracks[audio_choice], audio_lang)
         if not audio_lang:
-            language = str(getattr(selected_anime, 'language', '') or '')
-            if language == 'dub':
-                audio_lang = 'ara,ar'
-            elif language == 'sub':
-                audio_lang = 'jpn,ja'
+            audio_lang = mode_audio_lang(language_mode)
+
         headers = getattr(quality, 'headers', None) or None
         ext = str(getattr(quality, 'ext', 'mp4') or 'mp4').lstrip('.')
-        
-        if direct_url and direct_url.startswith("http"):
-            quality_match = re.search(r"\b(\d{3,4}p)\b", quality.name)
-            quality_tag = quality_match.group(1) if quality_match else quality.name
-            filename = f"{selected_anime.title_en} - Ep {selected_ep.display_num} [{quality_tag}].{ext}"
-            
-            if action == 'download':
-                if is_hls_url(direct_url):
-                    self.ui.render_message(
-                        "Download Unavailable",
-                        "This source is an HLS playlist — play it with mpv instead.",
-                        "info",
-                    )
-                    return None
-                success = download_file(
-                    direct_url,
-                    filename,
-                    self.ui.console,
-                    mode=self._get_download_mode(),
-                    download_dir=self._get_download_directory(),
-                    headers=headers,
-                )
-                if success:
-                    self.history.mark_watched(selected_anime.id, selected_ep.display_num, selected_anime.title_en)
-                    return "download"
-                return None
-            else:
-                player_type = self.settings.get('player')
-                
-                # Determine resume timestamp
-                actual_start = 0.0
-                if start_time is not None and start_time > 0:
-                    actual_start = start_time
-                else:
-                    ep_prog = self.history.get_episode_progress(selected_anime.id, selected_ep.display_num)
-                    if ep_prog and 0 < ep_prog.get('percent', 0) < 90 and ep_prog.get('time_pos', 0) > 10:
-                        actual_start = ep_prog['time_pos']
-                    elif getattr(self.provider, 'id', '') == 'anime3rb' or 'vid3rb.com' in direct_url:
-                        # Skip 5-second intro bumper for Anime3rb provider only
-                        actual_start = 5.0
+        quality_match = re.search(r"\b(\d{3,4}p)\b", quality.name)
+        quality_tag = quality_match.group(1) if quality_match else quality.name
 
-                time_hint = f" • Resuming at {format_seconds(actual_start)}" if (actual_start > 0) else ""
-                self.ui.render_now_playing(selected_anime.title_en, f"Episode {selected_ep.display_num}{time_hint}", quality.name)
-                
-                self.rpc.update_watching(selected_anime.title_en, str(selected_ep.display_num), selected_anime.thumbnail)
-                
-                playback_info = self.player.play(
-                    direct_url, 
-                    f"{selected_anime.title_en} - Ep {selected_ep.display_num} ({quality.name})", 
-                    player_type=player_type,
-                    start_time=actual_start,
-                    audio_lang=audio_lang or None,
-                    headers=headers,
-                    subtitle_url=getattr(quality, 'subtitle_url', '') or None,
-                    subtitle_lang=getattr(quality, 'subtitle_lang', '') or None,
-                    audio_url=getattr(quality, 'audio_url', '') or None,
-                )
-                self.ui.clear()
-                
-                pos = playback_info.get('time_pos', 0.0) if isinstance(playback_info, dict) else 0.0
-                dur = playback_info.get('duration', 0.0) if isinstance(playback_info, dict) else 0.0
-                pct = playback_info.get('percent', 0.0) if isinstance(playback_info, dict) else 0.0
-                self.history.mark_watched(
-                    selected_anime.id, 
-                    selected_ep.display_num, 
-                    selected_anime.title_en,
-                    time_pos=pos,
-                    duration=dur,
-                    percent=pct,
-                    poster_url=getattr(selected_anime, 'thumbnail', ''),
-                    provider=getattr(self.provider, 'id', '')
-                )
-                self.rpc.update_selecting_episode(selected_anime.title_en, selected_anime.thumbnail)
-                return "watch"
-        else:
+        if not (direct_url and direct_url.startswith("http")):
             self.ui.render_message(
-                "✗ Error", 
-                "Failed to resolve direct video stream for this quality.", 
+                "✗ Error",
+                "Failed to resolve direct video stream for this quality.",
                 "error"
             )
             return None
+
+        if action == 'download':
+            plan = DownloadPlan(
+                url=direct_url,
+                headers=dict(headers or {}),
+                quality=quality_tag,
+                ext=ext,
+                subtitle_url=subtitle_url,
+                subtitle_lang=subtitle_lang,
+                subtitles=subtitles,
+                master_url=getattr(quality, 'master_url', '') or '',
+                audio_lang=audio_lang,
+            )
+            result = download_single_episode(
+                api=self.api,
+                anime=selected_anime,
+                ep=selected_ep,
+                config=self._download_config(
+                    quality=quality_tag,
+                    subtitle_lang=subtitle_lang,
+                ),
+                console=self.ui.console,
+                plan=plan,
+            )
+            if self._finish_single_download(selected_anime, selected_ep, result):
+                return "download"
+            return None
+
+        player_type = self.settings.get('player')
+
+        actual_start = 0.0
+        if start_time is not None and start_time > 0:
+            actual_start = start_time
+        else:
+            ep_prog = self.history.get_episode_progress(
+                selected_anime.id, selected_ep.display_num, provider=getattr(self.provider, 'id', '')
+            )
+            if ep_prog and 0 < ep_prog.get('percent', 0) < 90 and ep_prog.get('time_pos', 0) > 10:
+                actual_start = ep_prog['time_pos']
+            elif getattr(self.provider, 'id', '') == 'anime3rb' or 'vid3rb.com' in direct_url:
+                # Skip 5-second intro bumper for Anime3rb provider only
+                actual_start = 5.0
+
+        subtitles_disabled = bool(subtitles) and subtitle_choice is None
+        # A master playlist is required for native HLS audio-rendition
+        # selection; without separate renditions keep the chosen variant.
+        playback_url = direct_url
+        playback_bitrate = 0
+        if audio_tracks and getattr(quality, 'master_url', ''):
+            playback_url = quality.master_url
+            playback_bitrate = int(getattr(quality, 'bandwidth', 0) or 0)
+        time_hint = f" • Resuming at {format_seconds(actual_start)}" if (actual_start > 0) else ""
+        self.ui.render_now_playing(
+            selected_anime.title_en,
+            f"Episode {selected_ep.display_num}{time_hint}",
+            quality.name,
+        )
+
+        self.rpc.update_watching(selected_anime.title_en, str(selected_ep.display_num), selected_anime.thumbnail)
+
+        try:
+            playback_info = self.player.play(
+                playback_url,
+                f"{selected_anime.title_en} - Ep {selected_ep.display_num} ({quality.name})",
+                player_type=player_type,
+                start_time=actual_start,
+                audio_lang=audio_lang or None,
+                headers=headers,
+                subtitle_url=subtitle_url or None,
+                subtitle_lang=subtitle_lang or None,
+                audio_url=getattr(quality, 'audio_url', '') or None,
+                subtitles_disabled=subtitles_disabled,
+                hls_bitrate=playback_bitrate or None,
+            )
+        except FileNotFoundError as error:
+            self.ui.render_message("✗ Player Missing", str(error), "error")
+            return None
+        except Exception as error:
+            self.ui.render_message("✗ Playback Error", f"Could not launch player: {error}", "error")
+            return None
+        self.ui.clear()
+
+        playback_info = playback_info if isinstance(playback_info, dict) else {}
+        pos = playback_info.get('time_pos', 0.0)
+        dur = playback_info.get('duration', 0.0)
+        pct = playback_info.get('percent', 0.0)
+        position_reported = bool(playback_info.get('position_reported', False))
+
+        # Only persist a position when the player actually reported one. VLC,
+        # Celluloid, IINA, Syncplay and MPC-HC cannot report their final
+        # position, so their history entry just records the episode as started.
+        if position_reported:
+            self.history.mark_watched(
+                selected_anime.id,
+                selected_ep.display_num,
+                selected_anime.title_en,
+                time_pos=pos,
+                duration=dur,
+                percent=pct,
+                poster_url=getattr(selected_anime, 'thumbnail', ''),
+                provider=getattr(self.provider, 'id', ''),
+                language_mode=language_mode,
+            )
+        else:
+            self.history.mark_watched(
+                selected_anime.id,
+                selected_ep.display_num,
+                selected_anime.title_en,
+                poster_url=getattr(selected_anime, 'thumbnail', ''),
+                provider=getattr(self.provider, 'id', ''),
+                language_mode=language_mode,
+            )
+        self.rpc.update_selecting_episode(selected_anime.title_en, selected_anime.thumbnail)
+        return "watch"
 
     def handle_exit(self):
         self.ui.clear()

@@ -2,7 +2,7 @@
 # THIS IS THE SINGLE SOURCE OF VERSION
 # All other files (pyproject.toml, workflows, etc.) read from here
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 APP_NAME = "NyoAnime"
 APP_VERSION = f"v{__version__}"

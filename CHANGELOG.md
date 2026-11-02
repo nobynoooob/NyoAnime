@@ -4,6 +4,30 @@ All notable changes to **NyoAnime** are documented here.
 
 ---
 
+## [2.2.0] - 2026-11-02
+
+### Added
+- **Native HLS engine** (`nyoanime/hls.py`): master/media playlist parsing, variant and bandwidth selection, `EXT-X-MAP` init segments, byterange segments, discontinuities, AES-128 decryption, expiry and DRM detection, retries, resume via `.part` and sidecar state, cancellation, progress, and integrity checks.
+- **Separate HLS audio renditions**: audio playlists are downloaded and muxed with ffmpeg; embedded renditions are selected in MPV with `--alang`.
+- **Downloaded subtitle sidecars** (`<video>.<lang>.vtt|.srt`) and completed-download listing/removal from the home screen (`d`).
+- **Quality, subtitle, and audio selection** in the TUI download flow, including language badges for history entries.
+
+### Changed
+- **Downloads** support provider-declared master URLs even without an `.m3u8` suffix, exact-quality skip checks, sanitized paths, and no silent overwrite.
+- **Subtitles** list the actual provider tracks plus Off; MPV uses `--sub-auto=no`, VLC/Celluloid/IINA/Syncplay disable autodetection, and unrelated local subtitles are never attached.
+- **Audio defaults** preserve Japanese for `en_sub`, prefer English for `en_dub`, and keep Arabic behavior unchanged.
+- **History** records provider, language mode, position, duration, and completion without duplicate or cross-provider mixing; legacy records are preserved and only provider-colliding IDs are namespaced.
+- **Resume** is honest: only MPV reports real playback position; other players expose `position_reported=False` and do not write fake progress.
+- **Version** bumped to `2.2.0`.
+
+### Fixed
+- VLC argument construction no longer combines an audio URL with a subtitle URL as one slave token.
+- MPV keeps the selected variant with `--hls-bitrate` when a master is required for HLS audio.
+- `StreamDownloader` discards empty downloads, validates final size, and no longer treats HTTP 416 as a completed file.
+- Player launch failures are surfaced instead of failing silently.
+
+---
+
 ## [2.1.1] - 2026-11-02
 
 ### Changed

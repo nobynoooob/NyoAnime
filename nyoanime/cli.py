@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import time
 import re
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from rich.console import Console
@@ -19,9 +20,22 @@ from nyoanime.version import APP_VERSION
 from nyoanime.config import DEFAULT_HEADER_ART, THEMES, POPULAR_GENRES
 from nyoanime.models import QualityOption, AnimeResult
 from nyoanime.providers import ProviderManager
-from nyoanime.utils import download_file
 from nyoanime.favorites import FavoritesManager
-from nyoanime.downloader import prompt_download_options, execute_batch_download, parse_batch_ranges, is_hls_url
+from nyoanime.downloader import (
+    DownloadConfig,
+    DownloadPlan,
+    download_single_episode,
+    execute_batch_download,
+    parse_batch_ranges,
+    parse_speed_limit,
+    prompt_download_options,
+)
+from nyoanime.providers.language import (
+    language_badge,
+    mode_audio_lang,
+    normalize_language_mode,
+    provider_language_mode,
+)
 
 
 def clean_season(season_str: Optional[str]) -> str:
@@ -224,8 +238,9 @@ class NyoAnimeWrapper:
             time.sleep(1.8)
             return False
 
+        provider_id = getattr(self.api, 'id', '') or getattr(self.api, 'name', '')
         start_time = 0.0
-        ep_prog = self.history.get_episode_progress(anime.id, ep.display_num)
+        ep_prog = self.history.get_episode_progress(anime.id, ep.display_num, provider=provider_id)
         if ep_prog and 0 < ep_prog.get('percent', 0) < 90 and ep_prog.get('time_pos', 0) > 10:
             start_time = ep_prog['time_pos']
         elif getattr(self.api, 'id', '') == 'anime3rb' or 'vid3rb.com' in direct_url:
@@ -236,16 +251,22 @@ class NyoAnimeWrapper:
 
         audio_lang = getattr(selected_q, 'audio_lang', '') or ''
         if not audio_lang:
-            language = str(getattr(anime, 'language', '') or '')
-            if language == 'dub':
-                audio_lang = 'ara,ar'
-            elif language == 'sub':
-                audio_lang = 'jpn,ja'
+            configured_mode = self.settings_manager.get('language_mode')
+            language_mode = normalize_language_mode(configured_mode) if configured_mode else provider_language_mode(provider_id)
+            audio_lang = mode_audio_lang(language_mode)
+        else:
+            configured_mode = self.settings_manager.get('language_mode')
+            language_mode = normalize_language_mode(configured_mode) if configured_mode else provider_language_mode(provider_id)
         headers = getattr(selected_q, 'headers', None) or None
+        playback_url = direct_url
+        playback_bitrate = 0
+        if getattr(selected_q, 'audio_tracks', None) and getattr(selected_q, 'master_url', ''):
+            playback_url = selected_q.master_url
+            playback_bitrate = int(getattr(selected_q, 'bandwidth', 0) or 0)
 
         player_type = self.settings_manager.get('player')
         playback_info = self.player.play(
-            direct_url,
+            playback_url,
             f"{anime.title_en} - Episode {ep.number}",
             player_type=player_type,
             start_time=start_time,
@@ -254,11 +275,14 @@ class NyoAnimeWrapper:
             subtitle_url=getattr(selected_q, 'subtitle_url', '') or None,
             subtitle_lang=getattr(selected_q, 'subtitle_lang', '') or None,
             audio_url=getattr(selected_q, 'audio_url', '') or None,
+            hls_bitrate=playback_bitrate or None,
         )
 
-        pos = playback_info.get('time_pos', 0.0) if isinstance(playback_info, dict) else 0.0
-        dur = playback_info.get('duration', 0.0) if isinstance(playback_info, dict) else 0.0
-        pct = playback_info.get('percent', 0.0) if isinstance(playback_info, dict) else 0.0
+        playback_info = playback_info if isinstance(playback_info, dict) else {}
+        position_reported = bool(playback_info.get('position_reported', False))
+        pos = playback_info.get('time_pos', 0.0) if position_reported else 0.0
+        dur = playback_info.get('duration', 0.0) if position_reported else 0.0
+        pct = playback_info.get('percent', 0.0) if position_reported else 0.0
 
         self.history.mark_watched(
             anime.id,
@@ -268,7 +292,8 @@ class NyoAnimeWrapper:
             duration=dur,
             percent=pct,
             poster_url=getattr(anime, 'thumbnail', ''),
-            provider=getattr(self.api, 'name', 'Anime3rb')
+            provider=provider_id,
+            language_mode=language_mode,
         )
         return True
 
@@ -305,26 +330,64 @@ class NyoAnimeWrapper:
             self.console.print("[red]Failed to extract direct download link.[/red]")
             return False
 
-        if is_hls_url(direct_url):
-            self.console.print("[yellow]HLS playlist — play it with mpv instead of downloading.[/yellow]")
+        q_tag = getattr(selected_q, 'name', 'HD')
+        match = re.search(r"\b(\d{3,4}p)\b", str(q_tag or ""))
+        if match:
+            q_tag = match.group(1)
+        ext = str(getattr(selected_q, 'ext', 'mp4') or 'mp4').lstrip('.')
+        d_dir = self.settings_manager.get('download_directory', 'downloads') or 'downloads'
+        headers = getattr(selected_q, 'headers', None) or {}
+        config = DownloadConfig(
+            save_dir=Path(d_dir).expanduser(),
+            quality=q_tag,
+            speed_limit_bytes=parse_speed_limit(self.settings_manager.get('download_speed_limit')),
+            subtitle_lang=getattr(selected_q, 'subtitle_lang', '') or None,
+            provider=getattr(self.api, 'id', '') or getattr(self.api, 'name', ''),
+        )
+        configured_mode = self.settings_manager.get('language_mode')
+        config.language_mode = (
+            normalize_language_mode(configured_mode)
+            if configured_mode
+            else provider_language_mode(config.provider)
+        )
+        plan = DownloadPlan(
+            url=direct_url,
+            headers=dict(headers),
+            quality=q_tag,
+            ext=ext,
+            subtitle_url=getattr(selected_q, 'subtitle_url', '') or '',
+            subtitle_lang=getattr(selected_q, 'subtitle_lang', '') or '',
+            subtitles=list(getattr(selected_q, 'subtitles', None) or []),
+            master_url=getattr(selected_q, 'master_url', '') or '',
+            audio_lang=getattr(selected_q, 'audio_lang', '') or '',
+        )
+        result = download_single_episode(
+            api=self.api,
+            anime=anime,
+            ep=ep,
+            config=config,
+            console=self.console,
+            plan=plan,
+        )
+        if not result.get("success"):
+            self.console.print(f"\n[bold red]✖ Download failed:[/bold red] {result.get('error') or 'unknown error'}")
             return False
 
-        q_tag = getattr(selected_q, 'name', 'HD')
-        ext = str(getattr(selected_q, 'ext', 'mp4') or 'mp4').lstrip('.')
-        filename = f"{anime.title_en} - Ep {ep.display_num} [{q_tag}].{ext}"
-        mode = self.settings_manager.get('download_mode', 'internal') or 'internal'
-        d_dir = self.settings_manager.get('download_directory', 'downloads') or 'downloads'
-        headers = getattr(selected_q, 'headers', None) or None
-
-        res = download_file(
-            direct_url,
-            filename,
-            self.console,
-            mode=mode,
-            download_dir=d_dir,
-            headers=headers,
+        provider_id = getattr(self.api, 'id', '') or getattr(self.api, 'name', '')
+        configured_mode = self.settings_manager.get('language_mode')
+        self.history.mark_watched(
+            anime.id,
+            ep.display_num,
+            anime.title_en,
+            poster_url=getattr(anime, 'thumbnail', ''),
+            provider=provider_id,
+            language_mode=(
+                normalize_language_mode(configured_mode)
+                if configured_mode
+                else provider_language_mode(provider_id)
+            ),
         )
-        return res
+        return True
 
     def batch_download(self, anime: Any, episodes: List[Any]):
         self.console.print(f"\n[bold cyan]Batch Download: {anime.title_en}[/bold cyan]")
@@ -357,6 +420,14 @@ class NyoAnimeWrapper:
         config = prompt_download_options(self.console, default_dir=default_dir, default_quality=default_q, batch_mode=True)
         if not config:
             return
+
+        config.provider = getattr(self.api, 'id', '') or getattr(self.api, 'name', '')
+        configured_mode = self.settings_manager.get('language_mode')
+        config.language_mode = (
+            normalize_language_mode(configured_mode)
+            if configured_mode
+            else provider_language_mode(config.provider)
+        )
 
         execute_batch_download(
             api=self.api,
@@ -466,14 +537,15 @@ class NyoAnimeWrapper:
             time.sleep(1.0)
             return
 
-        last_watched = self.history.get_last_watched(anime.id)
+        provider_id = getattr(self.api, 'id', '') or getattr(self.api, 'name', '')
+        last_watched = self.history.get_last_watched(anime.id, provider=provider_id)
 
         while True:
             ep_map: Dict[str, Any] = {}
             ep_lines: List[str] = []
 
             for ep in episodes:
-                prog = self.history.get_episode_progress(anime.id, ep.display_num)
+                prog = self.history.get_episode_progress(anime.id, ep.display_num, provider=provider_id)
                 pct = prog.get('percent', 0)
                 is_last = str(ep.number) == str(last_watched)
 
@@ -686,10 +758,12 @@ class NyoAnimeWrapper:
         map_h = {}
         for h in items:
             t = h.get('title', 'Unknown')
-            ep_n = h.get('last_episode', '?')
+            ep_n = h.get('episode') or h.get('last_episode') or '?'
             pct = h.get('percent', 0)
             pct_str = f"[✓ {pct}%]" if pct >= 90 else (f"[{pct}%]" if pct > 0 else "")
-            line = f"\033[36m{t[:50]}\033[0m  \033[33mEp {ep_n}\033[0m  \033[32m{pct_str}\033[0m"
+            badge = language_badge(h.get('language_mode')) if h.get('language_mode') else ''
+            badge_str = f" \033[35m[{badge}]\033[0m" if badge else ""
+            line = f"\033[36m{t[:50]}\033[0m{badge_str}  \033[33mEp {ep_n}\033[0m  \033[32m{pct_str}\033[0m"
             lines.append(line)
             map_h[line] = h
 
@@ -701,8 +775,19 @@ class NyoAnimeWrapper:
         if sel:
             chosen = map_h.get(sel[0]) or map_h.get(re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', sel[0]))
             if chosen:
+                item_id = str(chosen.get('anime_id', ''))
+                item_provider = str(chosen.get('provider') or '')
+                if item_provider:
+                    canonical = ProviderManager.get_canonical_id(item_provider)
+                    if item_id.startswith(f"{canonical}:"):
+                        item_id = item_id.split(":", 1)[1]
+                    if canonical and canonical != getattr(self.api, 'id', ''):
+                        ProviderManager.set_active_provider(canonical)
+                        self.settings_manager.set('anime_provider', canonical)
+                        self.settings_manager.set('language_mode', provider_language_mode(canonical))
+                        self.api = ProviderManager.get_provider(canonical)
                 mock_anime = AnimeResult(
-                    id=chosen.get('anime_id', ''),
+                    id=item_id,
                     title_en=chosen.get('title', ''),
                     title_jp='',
                     type='SERIES',

@@ -68,8 +68,14 @@ class QualityOption:
     # Optional sidecar tracks for providers that expose them separately.
     subtitle_url: str = ""
     subtitle_lang: str = ""
-    subtitles: List[Dict[str, str]] = field(default_factory=list)
+    subtitles: List[Dict[str, Any]] = field(default_factory=list)
     audio_url: str = ""
+    # HLS audio renditions (embedded in the master playlist, not sidecar files).
+    audio_tracks: List[Dict[str, Any]] = field(default_factory=list)
+    # Master playlist when variants/audio renditions must be selected by the player.
+    master_url: str = ""
+    # Selected variant bandwidth, used by mpv --hls-bitrate when playing a master.
+    bandwidth: int = 0
 
     @property
     def url(self) -> str:
