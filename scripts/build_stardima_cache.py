@@ -5,7 +5,7 @@ Build the Stardima anime/cartoon/live-action classification cache.
 Usage:
     STARDIMA_TMDB_KEY=... python scripts/build_stardima_cache.py
 
-The generated `src/providers/stardima_catalog.json` is committed so the app
+The generated `nyoanime/providers/stardima_catalog.json` is committed so the app
 does not need a TMDB key at runtime.  TMDB responses are cached under
 `scripts/.cache/tmdb/` so reruns are cheap.
 
@@ -35,7 +35,7 @@ import requests
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.providers.stardima_client import (  # noqa: E402
+from nyoanime.providers.stardima_client import (  # noqa: E402
     APP_UA,
     CARTOON_CATEGORY_SLUGS,
     StardimaAuth,
@@ -44,7 +44,7 @@ from src.providers.stardima_client import (  # noqa: E402
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_CACHE = ROOT / "scripts" / ".cache" / "tmdb"
-OUT_FILE = ROOT / "src" / "providers" / "stardima_catalog.json"
+OUT_FILE = ROOT / "nyoanime" / "providers" / "stardima_catalog.json"
 ANIMATION_GENRE = 16
 ANIME_LANGUAGES = {"ja", "zh", "ko"}
 

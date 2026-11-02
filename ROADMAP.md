@@ -1,33 +1,26 @@
-# ani-cli-arabic Roadmap
+# NyoAnime Roadmap
 
-Future milestones and distribution plans for ani-cli-arabic.
+Planned work, roughly in priority order.
 
----
+## 1. Stability
 
-## 1. User Profiles & Sync
-* **Watch History & Favorites Sync**:
-  - Optional cloud backup for watch history and bookmarks.
-  - Multi-device continuity between machines.
+- Broaden provider integration tests and fixture coverage.
+- Improve stream extraction fallbacks when providers change markup.
+- Harden download resume across interrupted connections.
 
----
+## 2. User Experience
 
-## 2. Universal Packaging & Distribution
-Automate package publishing for common package managers:
+- Refine TUI layout for narrow terminals.
+- Add configurable keybindings.
+- Improve Arabic search normalization and title matching.
 
-* **Windows**:
-  - **WinGet**: Manifest automation.
-  - **Scoop**: Scoop bucket integration.
-* **Linux**:
-  - **Arch Linux**: AUR package (`ani-cli-arabic` & `ani-cli-arabic-git`).
-  - **Ubuntu / Debian**: `.deb` packaging.
-  - **AppImage**: Standalone bundle.
-* **Python**:
-  - **PyPI**: Automated workflow on release tags.
+## 3. Packaging
 
----
+- Standalone builds for Linux, macOS, and Windows.
+- Optional Arch, Debian, and Homebrew packaging maintained by contributors.
+- Reproducible release artifacts with checksums.
 
-## 3. Release Pipeline
-* Release workflow for tagged builds:
-  1. Build wheel & sdist for PyPI.
-  2. Generate SHA256 checksums.
-  3. Publish release artifacts.
+## 4. Offline-Friendly Features
+
+- Import/export history and favorites as plain JSON.
+- Optional local metadata cache to reduce provider requests.

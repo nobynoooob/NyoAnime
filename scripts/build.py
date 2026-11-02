@@ -71,7 +71,7 @@ a = Analysis(
     pathex=[str(script_dir)],
     binaries={binaries},
     datas=[
-        (str(script_dir / 'src'), 'src'),
+        (str(script_dir / 'nyoanime'), 'nyoanime'),
     ],
     hiddenimports=[
         'pypresence',
@@ -85,24 +85,41 @@ a = Analysis(
         'rich.box',
         'rich.table',
         'requests',
-        'cryptography',
-        'cryptography.fernet',
-        'src.version',
-        'src.updater',
-        'src.config',
-        'src.app',
-        'src.api',
-        'src.player',
-        'src.discord_rpc',
-        'src.models',
-        'src.ui',
-        'src.utils',
-        'src.history',
+        'nyoanime.version',
+        'nyoanime.config',
+        'nyoanime.app',
+        'nyoanime.api',
+        'nyoanime.player',
+        'nyoanime.discord_rpc',
+        'nyoanime.models',
+        'nyoanime.ui',
+        'nyoanime.utils',
+        'nyoanime.history',
+        'nyoanime.settings',
+        'nyoanime.favorites',
+        'nyoanime.downloader',
+        'nyoanime.changelog',
+        'nyoanime.logger',
+        'nyoanime.monitoring',
+        'nyoanime.storage',
+        'nyoanime.deps',
+        'nyoanime.providers',
+        'nyoanime.providers.anime3rb',
+        'nyoanime.providers.anime_slayer',
+        'nyoanime.providers.animeify',
+        'nyoanime.providers.hianime',
+        'nyoanime.providers.stardima',
+        'nyoanime.providers.stardima_client',
+        'curl_cffi',
+        'bs4',
+        'Crypto',
+        'arabic_reshaper',
+        'bidi',
     ],
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=['IPython', 'jupyter', 'notebook', 'matplotlib', 'scipy', 'pandas', 'numpy', 'tkinter'],
+    excludes=['IPython', 'jupyter', 'notebook', 'matplotlib', 'scipy', 'pandas', 'tkinter'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -118,7 +135,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='ani-cli-ar',
+    name='nyo',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -143,7 +160,7 @@ exe = EXE(
     
     spec_content = spec_content.format(script_dir=str(script_dir), binaries=binaries)
     
-    spec_file = Path(__file__).parent / "ani-cli-ar.spec"
+    spec_file = Path(__file__).parent / "nyo.spec"
     with open(spec_file, 'w', encoding='utf-8') as f:
         f.write(spec_content)
     
@@ -314,9 +331,9 @@ def build_executable(bundle_mpv=False):
     
     # Find the executable
     if system == "Windows":
-        exe_name = "ani-cli-ar.exe"
+        exe_name = "nyo.exe"
     else:
-        exe_name = "ani-cli-ar"
+        exe_name = "nyo"
     
     exe_path = dist_dir / exe_name
     
@@ -336,7 +353,7 @@ def build_executable(bundle_mpv=False):
     return False
 
 def main():
-    print_header("ani-cli-arabic Build Tool")
+    print_header("NyoAnime Build Tool")
     
     # Check PyInstaller
     if not check_pyinstaller():

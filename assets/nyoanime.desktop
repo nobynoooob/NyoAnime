@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NyoAnime
+Comment=Terminal-based anime streaming with Arabic subtitles
+Exec=nyoanime
+Icon=nyoanime
+Terminal=true
+Categories=Video;AudioVideo;Player;ConsoleOnly;
+Keywords=anime;streaming;arabic;cli;
+StartupNotify=false

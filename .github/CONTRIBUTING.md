@@ -1,87 +1,53 @@
-# Contributing to ani-cli-arabic
+# Contributing to NyoAnime
 
-Thank you for your interest in contributing to ani-cli-arabic! We welcome contributions that:
+Bug fixes, provider updates, UI improvements, and documentation are welcome.
 
-- Fix bugs
-- Add new features
-- Enhance user experience
-- Improve documentation
-- Optimize performance
+## Development setup
 
-## Development Setup
-
-1. Fork and clone the repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/ani-cli-arabic.git
-cd ani-cli-arabic
-```
-
-2. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/Scripts/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+git clone <repository-url> nyoanime
+cd nyoanime
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+python3 main.py
 ```
 
-4. Run from source:
-```bash
-python main.py
-```
+## Code style
 
-## Code Style
-
-- Follow PEP 8 guidelines
-- Use type hints where appropriate
-- Add docstrings to functions and classes
-- Use f-strings for string formatting
-- Keep functions focused and modular
+- PEP 8, four-space indentation.
+- Type hints where they add clarity.
+- Docstrings for non-obvious public functions.
+- Keep modules focused; avoid new dependencies unless necessary.
 
 ## Testing
 
-Before submitting a PR:
+Run the suite before opening a pull request:
 
-1. Test your changes thoroughly
-2. Ensure the app runs without errors
-3. Test on your target platform (Windows/Linux/Mac)
-4. Check for any new dependencies
-
-## Pull Request Process
-
-1. Create a new branch for your feature:
 ```bash
-git checkout -b feature/your-feature-name
+python3 -m pytest -q
 ```
 
-2. Make your changes and commit:
-```bash
-git add .
-git commit -m "Description of changes"
-```
+Provider tests may hit live services. If a provider is temporarily down, note it in the PR instead of weakening assertions.
 
-3. Push to your fork:
-```bash
-git push origin feature/your-feature-name
-```
+## Pull requests
 
-4. Open a Pull Request with:
-   - Clear description of changes
-   - Any relevant issue numbers
-   - Screenshots/demos if applicable
+1. Branch from `main`.
+2. Keep changes scoped and describe the behavior change.
+3. Include reproduction steps for bug fixes.
+4. Update tests and docs when behavior changes.
 
-## Reporting Issues
+## Reporting issues
 
-When reporting bugs, please include:
+Include:
 
-- Operating system and version
+- OS and version
 - Python version
+- Provider and query used
 - Steps to reproduce
 - Expected vs actual behavior
-- Error messages or logs
+- Relevant lines from `~/.nyoanime/debug.log`
 
-## Questions?
+## Security
 
-Feel free to open an issue for questions or discussions!
+Do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md).

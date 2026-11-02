@@ -15,12 +15,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.app import normalize_latest_episodes
-from src.models import AnimeResult, Episode, QualityOption
-from src.providers.base import BaseAnimeProvider
-from src.providers.manager import ProviderManager
-from src.providers.stardima import StardimaKidsProvider, StardimaProvider
-from src.providers.stardima_client import (
+from nyoanime.app import normalize_latest_episodes
+from nyoanime.models import AnimeResult, Episode, QualityOption
+from nyoanime.providers.base import BaseAnimeProvider
+from nyoanime.providers.manager import ProviderManager
+from nyoanime.providers.stardima import StardimaKidsProvider, StardimaProvider
+from nyoanime.providers.stardima_client import (
     StardimaAuth,
     StardimaClassifier,
     StardimaClient,
@@ -744,7 +744,7 @@ class TestStardimaRegistry:
 
 class TestPlayerAudio:
     def _run_mpv(self, monkeypatch, **kwargs):
-        import src.player as player_module
+        import nyoanime.player as player_module
 
         captured = {}
 
@@ -762,7 +762,7 @@ class TestPlayerAudio:
             captured["args"] = args
             return SimpleNamespace(returncode=0, stderr="")
 
-        import src.utils as utils_module
+        import nyoanime.utils as utils_module
 
         monkeypatch.setattr(player_module, "MpvTracker", FakeTracker)
         monkeypatch.setattr(player_module.subprocess, "run", fake_run)

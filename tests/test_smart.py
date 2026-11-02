@@ -1,5 +1,5 @@
 """
-Smart Diagnostics & Regression Test Suite for ani-cli-arabic
+Smart Diagnostics & Regression Test Suite for NyoAnime
 Tests provider contracts, scrapers, CLI/TUI logic, settings, history, and player args.
 """
 
@@ -11,13 +11,13 @@ from pathlib import Path
 # Ensure root directory is on PYTHONPATH
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.models import AnimeResult, QualityOption
-from src.providers.base import BaseAnimeProvider
-from src.providers.manager import ProviderManager
-from src.settings import SettingsManager
-from src.storage import atomic_write_json
-from src.history import HistoryManager
-from src.cli import clean_season, clean_episodes, AniCliWrapper
+from nyoanime.models import AnimeResult, QualityOption
+from nyoanime.providers.base import BaseAnimeProvider
+from nyoanime.providers.manager import ProviderManager
+from nyoanime.settings import SettingsManager
+from nyoanime.storage import atomic_write_json
+from nyoanime.history import HistoryManager
+from nyoanime.cli import clean_season, clean_episodes, NyoAnimeWrapper
 
 
 class TestProviderArchitecture:
@@ -121,7 +121,7 @@ class TestCliLogicAndHelpers:
         prov = ProviderManager.get_provider("anime3rb")
         settings = SettingsManager()
         history = HistoryManager()
-        wrapper = AniCliWrapper(
+        wrapper = NyoAnimeWrapper(
             api=prov,
             player=None,
             history=history,
@@ -179,7 +179,7 @@ class TestNativeDownloader:
     """Tests custom pure-Python downloader parsing, sanitization, and config."""
 
     def test_parse_speed_limit(self):
-        from src.downloader import parse_speed_limit, format_speed
+        from nyoanime.downloader import parse_speed_limit, format_speed
         assert parse_speed_limit("0") is None
         assert parse_speed_limit("unlimited") is None
         assert parse_speed_limit("none") is None
@@ -193,13 +193,13 @@ class TestNativeDownloader:
         assert format_speed(512 * 1024) == "512 KB/s"
 
     def test_sanitize_filename(self):
-        from src.downloader import sanitize_filename
+        from nyoanime.downloader import sanitize_filename
         assert sanitize_filename('Naruto: Shippuuden / Ep <1>.mp4') == 'Naruto_ Shippuuden _ Ep _1_.mp4'
         assert sanitize_filename('') == 'download.mp4'
 
     def test_stream_downloader_resumable_logic(self):
         from unittest.mock import patch, MagicMock
-        from src.downloader import StreamDownloader
+        from nyoanime.downloader import StreamDownloader
 
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = Path(tmpdir) / "test_ep.mp4"
@@ -230,7 +230,7 @@ class TestNativeDownloader:
 
     def test_stream_downloader_skip_existing(self):
         from unittest.mock import MagicMock
-        from src.downloader import StreamDownloader
+        from nyoanime.downloader import StreamDownloader
 
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = Path(tmpdir) / "test_ep.mp4"
@@ -243,7 +243,7 @@ class TestNativeDownloader:
 
     def test_stream_downloader_stop_requested(self):
         from unittest.mock import patch, MagicMock
-        from src.downloader import StreamDownloader
+        from nyoanime.downloader import StreamDownloader
 
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = Path(tmpdir) / "test_ep.mp4"
@@ -259,7 +259,7 @@ class TestNativeDownloader:
     def _run_batch(self, tmpdir, episodes, servers_by_ep, download_ok=lambda url: True):
         from unittest.mock import MagicMock, patch
         from rich.console import Console
-        from src.downloader import DownloadConfig, execute_batch_download, StreamDownloader
+        from nyoanime.downloader import DownloadConfig, execute_batch_download, StreamDownloader
 
         api = MagicMock()
         api.get_streaming_servers.side_effect = lambda anime_id, ep_num, anime_type: servers_by_ep.get(ep_num)
@@ -278,7 +278,7 @@ class TestNativeDownloader:
         return results, api, calls, (Path(tmpdir) / "console.log").read_text(encoding="utf-8")
 
     def test_batch_skips_existing_before_resolving(self):
-        from src.models import Episode
+        from nyoanime.models import Episode
         episodes = [Episode(number=str(n), display_num=n) for n in (1, 2)]
         servers = {str(n): {"Qualities": [QualityOption("1080p", "1080p", direct_url=f"http://cdn/{n}.mp4")]} for n in (1, 2)}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -289,7 +289,7 @@ class TestNativeDownloader:
             assert resolved_eps == ["2"]
 
     def test_batch_continues_after_failures_and_lists_them(self):
-        from src.models import Episode
+        from nyoanime.models import Episode
         episodes = [Episode(number=str(n), display_num=n) for n in (1, 2, 3, 4)]
         servers = {
             "1": {"Qualities": [QualityOption("1080p", "1080p", direct_url="http://cdn/1.mp4", headers={"Referer": "https://x/"})]},
@@ -309,7 +309,7 @@ class TestNativeDownloader:
                 assert f"Ep {ep_num}" in output.split("Failed episodes:")[1]
 
     def test_parse_batch_ranges_comprehensive(self):
-        from src.downloader import parse_batch_ranges
+        from nyoanime.downloader import parse_batch_ranges
         assert parse_batch_ranges("1-5") == [1, 2, 3, 4, 5]
         assert parse_batch_ranges("5-1") == [1, 2, 3, 4, 5]
         assert parse_batch_ranges("1, 3, 5") == [1, 3, 5]
@@ -322,7 +322,7 @@ class TestNativeDownloader:
         assert parse_batch_ranges("") == []
 
     def test_ui_settings_dynamic_providers(self):
-        from src.providers.manager import ProviderManager
+        from nyoanime.providers.manager import ProviderManager
         prov_list = ProviderManager.list_providers()
         ids = [p["id"] for p in prov_list]
         assert "anime3rb" in ids
@@ -349,7 +349,7 @@ class TestNetworkOptimizationAndPooling:
         assert adapter_https._pool_connections >= 20
 
     def test_retry_with_backoff_decorator(self):
-        from src.api import retry_with_backoff
+        from nyoanime.api import retry_with_backoff
 
         calls = 0
 
@@ -366,18 +366,12 @@ class TestNetworkOptimizationAndPooling:
         assert calls == 2
 
     def test_cdn_health_manager(self):
-        from src.api import CDNHealthManager
+        from nyoanime.api import CDNHealthManager
         mgr = CDNHealthManager()
         # Seeded bad host
         assert not mgr.is_host_healthy("files-5.vid3rb.com")
         mgr.mark_unhealthy("test-bad-cdn.com", duration=100.0)
         assert not mgr.is_host_healthy("test-bad-cdn.com")
-
-    def test_get_github_stars_non_blocking(self):
-        from src.ui import get_github_stars
-        stars = get_github_stars(refresh_if_stale=False)
-        assert isinstance(stars, str)
-        assert len(stars) > 0
 
 
 class TestCliSettingsParityAndUtils:
@@ -386,7 +380,7 @@ class TestCliSettingsParityAndUtils:
     def test_settings_dialog_fields(self):
         sm = SettingsManager()
         # Ensure all 8 configurable keys exist and have proper defaults
-        assert sm.get("anime_provider") in ["anime3rb", "anime_slayer", "animeify", "hianime", "anidb", "stardima", "stardima_kids"]
+        assert sm.get("anime_provider") in ["anime3rb", "anime_slayer", "animeify", "hianime", "stardima", "stardima_kids"]
         assert sm.get("player") in ["mpv", "vlc", "celluloid", "iina", "syncplay", "mpc-hc"]
         assert sm.get("default_quality") in ["1080p", "720p", "480p", "360p", "auto", "best"]
         assert sm.get("default_download_quality") in ["1080p", "720p", "480p", "360p"]
@@ -396,7 +390,7 @@ class TestCliSettingsParityAndUtils:
         assert sm.get("theme") is not None
 
     def test_clean_genre_and_type(self):
-        from src.utils import clean_genre, clean_type, clean_status
+        from nyoanime.utils import clean_genre, clean_type, clean_status
         assert clean_genre("اكشن") == "Action"
         assert clean_genre("Action") == "Action"
         assert clean_type("مسلسل") == "TV"
@@ -439,7 +433,7 @@ class TestEdgeCasesAndBoundaryConditions:
         prov = ProviderManager.get_provider("anime3rb")
         sm = SettingsManager()
         hm = HistoryManager()
-        wrapper = AniCliWrapper(api=prov, player=None, history=hm, settings=sm, rpc=None)
+        wrapper = NyoAnimeWrapper(api=prov, player=None, history=hm, settings=sm, rpc=None)
 
         # 1. Server data with explicit Qualities
         q1 = QualityOption("1080p", "url_1080", "1080p")
@@ -463,13 +457,13 @@ class TestEdgeCasesAndBoundaryConditions:
         assert res3 == []
 
     def test_batch_range_parsing(self):
-        from src.downloader import parse_batch_ranges
+        from nyoanime.downloader import parse_batch_ranges
         assert parse_batch_ranges("1-3 5 8-10") == [1, 2, 3, 5, 8, 9, 10]
 
     def test_tab_key_navigation_in_settings(self, monkeypatch):
         import unittest.mock as mock
-        from src.ui import UIManager
-        from src.utils import get_key, get_home_input_event
+        from nyoanime.ui import UIManager
+        from nyoanime.utils import get_key, get_home_input_event
 
         # 1. Verify get_key and get_home_input_event parse tab and backtab
         with mock.patch('sys.stdin.fileno', return_value=0):
@@ -493,9 +487,9 @@ class TestEdgeCasesAndBoundaryConditions:
             panel = panel_align.renderable
             rendered_titles.append(str(panel.title))
 
-        with mock.patch('src.ui.get_key', side_effect=lambda: next(keys)):
+        with mock.patch('nyoanime.ui.get_key', side_effect=lambda: next(keys)):
             with mock.patch('rich.live.Live.update', side_effect=fake_update):
-                with mock.patch('src.ui.RawTerminal'):
+                with mock.patch('nyoanime.ui.RawTerminal'):
                     ui.settings_menu(sm)
 
         assert any('Playback' in t for t in rendered_titles)
@@ -505,8 +499,8 @@ class TestEdgeCasesAndBoundaryConditions:
         import io
         import unittest.mock as mock
         from rich.console import Console
-        from src.ui import UIManager
-        from src.providers.manager import ProviderManager
+        from nyoanime.ui import UIManager
+        from nyoanime.providers.manager import ProviderManager
 
         ui = UIManager()
 
@@ -524,9 +518,9 @@ class TestEdgeCasesAndBoundaryConditions:
                 def update(self, *args, **kwargs):
                     pass
 
-            with mock.patch('src.ui.get_home_input_event', return_value=('ESC', None)):
-                with mock.patch('src.ui.Live', FakeLive):
-                    with mock.patch('src.ui.MouseTerminal'):
+            with mock.patch('nyoanime.ui.get_home_input_event', return_value=('ESC', None)):
+                with mock.patch('nyoanime.ui.Live', FakeLive):
+                    with mock.patch('nyoanime.ui.MouseTerminal'):
                         ui.home_screen_menu(active_provider=p.name, provider=p)
 
             c = Console(width=80, file=io.StringIO(), color_system=None)
@@ -557,13 +551,87 @@ class TestEdgeCasesAndBoundaryConditions:
         p_stardima = ProviderManager.get_provider('stardima')
         p_anime3rb = ProviderManager.get_provider('anime3rb')
 
-        with mock.patch('src.ui.get_home_input_event', side_effect=[('CHAR', 's'), ('ENTER', None)]):
-            with mock.patch('src.ui.Live'):
-                with mock.patch('src.ui.MouseTerminal'):
+        with mock.patch('nyoanime.ui.get_home_input_event', side_effect=[('CHAR', 's'), ('ENTER', None)]):
+            with mock.patch('nyoanime.ui.Live'):
+                with mock.patch('nyoanime.ui.MouseTerminal'):
                     assert ui.home_screen_menu(active_provider=p_stardima.name, provider=p_stardima) == ('search', 's')
 
-        with mock.patch('src.ui.get_home_input_event', side_effect=[('CHAR', 's'), ('ENTER', None)]):
-            with mock.patch('src.ui.Live'):
-                with mock.patch('src.ui.MouseTerminal'):
+        with mock.patch('nyoanime.ui.get_home_input_event', side_effect=[('CHAR', 's'), ('ENTER', None)]):
+            with mock.patch('nyoanime.ui.Live'):
+                with mock.patch('nyoanime.ui.MouseTerminal'):
                     assert ui.home_screen_menu(active_provider=p_anime3rb.name, provider=p_anime3rb) == ('studios', None)
 
+
+    def test_home_screen_palette_tracks_active_theme(self):
+        import unittest.mock as mock
+        from nyoanime import config as config_mod
+        from nyoanime.ui import UIManager, _home_palette
+
+        ui = UIManager()
+        keys = ("COLOR_BORDER", "COLOR_TITLE", "COLOR_PROMPT", "COLOR_BOLT")
+        saved = {k: getattr(config_mod, k) for k in keys}
+        try:
+            config_mod.COLOR_BORDER = "#112233"
+            config_mod.COLOR_TITLE = "#445566"
+            config_mod.COLOR_PROMPT = "#778899"
+            config_mod.COLOR_BOLT = "#aabbcc"
+
+            palette = _home_palette()
+            assert palette["border"] == "#112233"
+            assert palette["accent"] == "#445566"
+            assert palette["prompt"] == "#778899"
+            assert palette["leaf_mid"] == "#aabbcc"
+
+            ui._apply_console_theme()
+            assert str(ui.console.get_style("border")) == "#112233"
+            assert str(ui.console.get_style("title")) == "#445566"
+        finally:
+            for key, value in saved.items():
+                setattr(config_mod, key, value)
+            ui._apply_console_theme()
+
+    def test_home_screen_scales_with_terminal(self):
+        import io
+        import unittest.mock as mock
+        from rich.console import Console
+        from nyoanime.ui import UIManager
+        from nyoanime.providers.manager import ProviderManager
+
+        ui = UIManager()
+        provider = ProviderManager.get_provider("anime3rb")
+        saved = []
+
+        class FakeLive:
+            def __init__(self, renderable, **kwargs):
+                saved.append(renderable)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def update(self, *args, **kwargs):
+                pass
+
+        for width, height in ((64, 20), (80, 24), (160, 48)):
+            saved.clear()
+            ui.console = Console(
+                width=width,
+                height=height,
+                file=io.StringIO(),
+                color_system=None,
+            )
+            with mock.patch("nyoanime.ui.get_home_input_event", return_value=("ESC", None)):
+                with mock.patch("nyoanime.ui.Live", FakeLive):
+                    with mock.patch("nyoanime.ui.MouseTerminal"):
+                        ui.home_screen_menu(active_provider=provider.name, provider=provider)
+
+            ui.console.print(saved[0])
+            text = ui.console.file.getvalue()
+            lines = text.splitlines()
+            assert lines, f"empty render at {width}x{height}"
+            assert len(lines) <= height, f"vertical overflow at {width}x{height}"
+            assert max(len(line) for line in lines) <= width, f"horizontal overflow at {width}x{height}"
+            assert "[e] latest eps" in text
+            assert "^c quit" in text

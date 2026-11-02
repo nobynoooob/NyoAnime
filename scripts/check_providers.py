@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Automated Provider Health Check & Status Generator for ani-cli-arabic.
+Automated provider health check for NyoAnime.
 Runs live integration health checks on all registered providers, records latency,
 evaluates extraction health, maintains a sliding 30-day uptime history, and writes
-a sanitized status.json to public endpoints.
+a local status.json report.
 """
 
 import sys
@@ -18,7 +18,7 @@ from typing import Dict, Any, List
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.providers import ProviderManager
+from nyoanime.providers import ProviderManager
 
 PROVIDERS_TO_TEST = [
     {

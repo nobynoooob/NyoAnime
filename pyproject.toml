@@ -3,16 +3,16 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ani-cli-arabic"
+name = "nyoanime"
 dynamic = ["version"]
 description = "Terminal-based anime streaming with Arabic subtitles"
 readme = "README.md"
 license = "GPL-3.0"
 authors = [
-    {name = "np4abdou1"}
+    {name = "NoBy"}
 ]
 maintainers = [
-    {name = "np4abdou1"}
+    {name = "NoBy"}
 ]
 keywords = ["anime", "streaming", "cli", "arabic", "subtitles", "terminal"]
 classifiers = [
@@ -44,22 +44,16 @@ dependencies = [
 # - mpv: Media player for streaming episodes
 # - ffmpeg: Multimedia framework (helper for mpv)
 
-[project.urls]
-Homepage = "https://github.com/np4abdou1/ani-cli-arabic"
-Repository = "https://github.com/np4abdou1/ani-cli-arabic"
-Issues = "https://github.com/np4abdou1/ani-cli-arabic/issues"
-Changelog = "https://github.com/np4abdou1/ani-cli-arabic/releases"
-
 [project.scripts]
-ani-cli-arabic = "src.app:main"
-ani-cli-ar = "src.app:main"
+nyoanime = "nyoanime.app:main"
+nyo = "nyoanime.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["nyoanime*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "src.version.__version__"}
+version = {attr = "nyoanime.version.__version__"}
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.txt", "*.db"]

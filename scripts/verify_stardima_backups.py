@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.providers.stardima_client import (  # noqa: E402
+from nyoanime.providers.stardima_client import (  # noqa: E402
     StardimaAuth,
     StardimaClassifier,
     StardimaClient,
