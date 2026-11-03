@@ -39,6 +39,7 @@ dependencies = [
     "arabic-reshaper>=3.0.0",# Arabic character shaping
     "python-bidi>=0.6.0",    # BiDi right-to-left layout
     "pycryptodome>=3.18.0",  # Crypto operations for stream decryption
+    "websockets>=12,<16",   # Watch Together relay server
 ]
 # External tools (auto-installed by deps.py):
 # - mpv: Media player for streaming episodes
@@ -50,7 +51,7 @@ nyo = "nyoanime.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nyoanime*"]
+include = ["nyoanime*", "party_server*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "nyoanime.version.__version__"}
