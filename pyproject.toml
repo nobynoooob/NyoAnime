@@ -40,6 +40,7 @@ dependencies = [
     "python-bidi>=0.6.0",    # BiDi right-to-left layout
     "pycryptodome>=3.18.0",  # Crypto operations for stream decryption
     "websockets>=12,<16",   # Watch Together relay server
+    "supabase>=2.0.0,<3.0.0", # Supabase Realtime client
 ]
 # External tools (auto-installed by deps.py):
 # - mpv: Media player for streaming episodes

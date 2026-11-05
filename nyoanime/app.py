@@ -114,9 +114,53 @@ class NyoAnimeApp:
         )
         parser.add_argument('-d', '--debug', action='store_true', help="Enable verbose debug logging to file and console")
         parser.add_argument('-v', '--version', action='store_true', help="Show version information")
+        parser.add_argument(
+            '--session-dir',
+            metavar='DIR',
+            help=(
+                "Use an isolated Supabase session directory.\n"
+                "Lets a second NyoAnime instance sign in as a different participant."
+            ),
+        )
+        parser.add_argument(
+            '--session-path',
+            metavar='FILE',
+            help="Use an exact Supabase session file instead of the default path.",
+        )
+        parser.add_argument(
+            '--setup-supabase',
+            action='store_true',
+            help=(
+                "Save SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY to ~/.nyoanime/.env.\n"
+                "Prompts once; the key is entered with hidden input."
+            ),
+        )
         parser.add_argument('query', nargs='*', help="Anime name to search for")
         
         args = parser.parse_args()
+
+        if args.session_path or args.session_dir:
+            from .party.session_storage import set_session_override
+
+            set_session_override(
+                session_dir=args.session_dir,
+                session_path=args.session_path,
+            )
+
+        if args.setup_supabase:
+            from .party.local_config import run_supabase_setup
+
+            try:
+                config_path = run_supabase_setup()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSetup cancelled.")
+                sys.exit(1)
+            except ValueError as exc:
+                print(f"Setup failed: {exc}")
+                sys.exit(1)
+            print(f"Saved Supabase configuration to {config_path}")
+            print("Start NyoAnime again to use it.")
+            sys.exit(0)
         
         if args.debug:
             logger.enable(console_mirror=True)
@@ -350,6 +394,33 @@ class NyoAnimeApp:
                     )
                     continue
                 self.handle_anime_selection(results)
+                continue
+
+            elif action == "watchtogether":
+                # Start Watch Together mode
+                from .ui_watchtogether import WatchTogetherUI
+
+                try:
+                    # One UI manager so Watch Together shares the live theme,
+                    # logo and menu language with the rest of NyoAnime. The
+                    # browse callback reuses the normal search/anime/episode
+                    # menus without tearing down the room transport.
+                    wwt_ui = WatchTogetherUI(
+                        self.ui,
+                        browse_callback=self.browse_anime_for_watch_together,
+                    )
+                    wwt_ui.handle_watch_together(self.api)
+                except KeyboardInterrupt:
+                    continue
+                except Exception:
+                    logger.error("WATCH", "Watch Together session failed", exc_info=True)
+                    self.ui.render_message(
+                        "Watch Together closed",
+                        "Something went wrong. Please try again.",
+                        "error",
+                    )
+                    continue
+                # After Watch Together exits, return to main menu
                 continue
 
     def handle_anime_selection_with_lazy_load(self, results, load_more_callback):
@@ -796,6 +867,216 @@ class NyoAnimeApp:
                 self.ui.render_message("Deleted", target["name"], "info")
             else:
                 self.ui.render_message("Error", f"Could not delete {target['name']}", "error")
+
+    def _resolve_watch_together_playback(self, api, anime, episode, language_mode):
+        """Resolve a direct stream for the picked episode without launching a player."""
+        episode_number = (
+            getattr(episode, 'number', None)
+            or getattr(episode, 'display_num', '')
+        )
+        try:
+            server_data = api.get_streaming_servers(
+                getattr(anime, 'id', ''),
+                episode_number,
+                getattr(anime, 'type', 'SERIES') or 'SERIES',
+            )
+        except Exception as exc:
+            logger.debug("WATCH", f"Could not resolve Watch Together stream: {exc}")
+            return None, "Couldn't resolve a stream for that episode."
+
+        if not isinstance(server_data, dict):
+            return None, "No stream servers available for that episode."
+
+        qualities = list(server_data.get('Qualities') or [])
+        if not qualities:
+            return None, "No video streams found for that episode."
+
+        preferred = str(self._get_default_download_quality() or '').lower()
+        choice = None
+        for quality in qualities:
+            label = f"{getattr(quality, 'name', '')} {getattr(quality, 'res', '')}".lower()
+            if preferred and preferred in label:
+                choice = quality
+                break
+        if choice is None:
+            def height(item):
+                match = re.search(r"(\d{3,4})p", f"{getattr(item, 'res', '')} {getattr(item, 'name', '')}")
+                return int(match.group(1)) if match else 0
+            choice = max(qualities, key=height)
+
+        current = server_data.get('CurrentEpisode') or {}
+        direct_url = (
+            getattr(choice, 'direct_url', '')
+            or getattr(choice, 'url', '')
+            or current.get(getattr(choice, 'server_key', ''), '')
+        )
+        if not str(direct_url).startswith('http'):
+            return None, "Couldn't resolve a direct video stream."
+
+        audio_tracks = list(getattr(choice, 'audio_tracks', []) or [])
+        master_url = getattr(choice, 'master_url', '') or ''
+        playback_url = master_url if audio_tracks and master_url else direct_url
+        bitrate = int(getattr(choice, 'bandwidth', 0) or 0) if playback_url == master_url else 0
+
+        subtitle_url = getattr(choice, 'subtitle_url', '') or ''
+        subtitle_lang = getattr(choice, 'subtitle_lang', '') or ''
+        audio_lang = getattr(choice, 'audio_lang', '') or ''
+        display = str(getattr(episode, 'display_num', '') or episode_number)
+        title = f"{getattr(anime, 'title_en', '') or 'Episode'} - Ep {display}"
+        quality_match = re.search(r"\b(\d{3,4}p)\b", str(getattr(choice, 'name', '')))
+        quality_tag = quality_match.group(1) if quality_match else str(getattr(choice, 'name', ''))
+
+        playback = {
+            'url': str(playback_url),
+            'title': title,
+            'episode_number': display,
+            'episode_title': str(getattr(episode, 'title', '') or ''),
+            'headers': dict(getattr(choice, 'headers', None) or {}),
+            'start_time': 0.0,
+            'audio_lang': audio_lang,
+            'subtitle_url': subtitle_url,
+            'subtitle_lang': subtitle_lang,
+            'audio_url': getattr(choice, 'audio_url', '') or '',
+            'subtitles_disabled': False,
+            'hls_bitrate': bitrate,
+            'quality': quality_tag,
+            'provider_id': getattr(api, 'id', ''),
+            'anime_id': getattr(anime, 'id', ''),
+        }
+        return playback, None
+
+    def browse_anime_for_watch_together(self, api):
+        """Pick an anime + episode with NyoAnime's normal browser menus.
+
+        Called from the Watch Together room. The room's transport and
+        subscriptions stay alive while this runs; returning ``None`` means the
+        user backed out and should land back in the room.
+        """
+        if api is None:
+            return None
+
+        from .utils import restore_terminal_for_input, enter_raw_mode_after_input
+
+        self.ui.clear()
+        self.ui.console.print(
+            "\n  [bold]Browse anime[/bold]  "
+            "[dim]The room stays open while you pick.[/dim]\n"
+        )
+        restore_terminal_for_input()
+        try:
+            query = self.ui.console.input(
+                "  [bold]Search[/bold] [dim](blank to return to the room):[/dim] "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        finally:
+            enter_raw_mode_after_input()
+
+        if not query:
+            return None
+
+        results = self.ui.run_with_loading("Searching...", api.search_anime, query)
+        if not results:
+            self.ui.render_message(
+                "No anime found",
+                f"No anime matching '{query}'. Try another spelling or title.",
+                "info",
+            )
+            return None
+
+        provider_id = getattr(api, "id", "")
+        while True:
+            anime_idx = self.ui.anime_selection_menu(results, api=api)
+            if anime_idx is None or anime_idx == -1:
+                return None
+
+            anime = results[anime_idx]
+            episodes = self.ui.run_with_loading(
+                "Loading episodes...",
+                api.get_episodes,
+                anime.id,
+            )
+            if not episodes:
+                self.ui.render_message(
+                    "No episodes",
+                    f"No episodes found for '{anime.title_en}'.",
+                    "error",
+                )
+                continue
+
+            last_watched = self.history.get_last_watched(anime.id, provider=provider_id)
+            progress = self.history.get_all_episodes_progress(anime.id, provider=provider_id)
+            is_favorite = self.favorites.is_favorite(anime.id)
+            details = {
+                "score": anime.score,
+                "rank": anime.rank,
+                "popularity": anime.popularity,
+                "rating": anime.rating,
+                "type": anime.type,
+                "episodes": anime.episodes,
+                "status": anime.status,
+                "studio": anime.creators,
+                "genres": anime.genres,
+                "language": getattr(anime, "language", ""),
+                "provider_language": getattr(api, "language", ""),
+                "content_type": getattr(anime, "content_type", ""),
+            }
+
+            while True:
+                ep_idx = self.ui.episode_selection_menu(
+                    anime.title_en,
+                    episodes,
+                    self.rpc,
+                    anime.thumbnail,
+                    last_watched_ep=last_watched,
+                    is_favorite=is_favorite,
+                    anime_details=details,
+                    default_download_quality=self._get_default_download_quality(),
+                    download_mode=self._get_download_mode(),
+                    download_path=self._get_download_directory(),
+                    episodes_progress=progress,
+                )
+                if ep_idx is None:
+                    break
+                if ep_idx == -1:
+                    return None
+                if ep_idx == "toggle_fav":
+                    if is_favorite:
+                        self.favorites.remove(anime.id)
+                    else:
+                        self.favorites.add(anime.id, anime.title_en, anime.thumbnail)
+                    is_favorite = not is_favorite
+                    continue
+                if isinstance(ep_idx, tuple) or ep_idx == "batch_mode":
+                    # Downloads aren't part of picking the room's episode.
+                    continue
+                try:
+                    episode = episodes[int(ep_idx)]
+                except (TypeError, ValueError, IndexError):
+                    continue
+
+                language_mode = self._language_mode()
+                try:
+                    playback, playback_error = self.ui.run_with_loading(
+                        "Resolving stream...",
+                        lambda: self._resolve_watch_together_playback(
+                            api, anime, episode, language_mode
+                        ),
+                    )
+                except Exception as exc:
+                    logger.debug("WATCH", f"Stream resolution failed: {exc}")
+                    playback, playback_error = None, (
+                        "Couldn't resolve a stream for that episode."
+                    )
+
+                return {
+                    "anime": anime,
+                    "episode": episode,
+                    "provider_id": provider_id,
+                    "language_mode": language_mode,
+                    "playback": playback,
+                    "playback_error": playback_error,
+                }
 
     def handle_anime_selection(self, results):
         while True:
@@ -1456,6 +1737,12 @@ class NyoAnimeApp:
 
 def main():
     install_global_exception_handler()
+
+    # Must happen before any Watch Together client resolves Supabase config.
+    from .party.local_config import load_local_env
+
+    load_local_env()
+
     home_dir = Path.home()
     db_dir = home_dir / ".nyoanime" / "database"
     db_dir.mkdir(parents=True, exist_ok=True)

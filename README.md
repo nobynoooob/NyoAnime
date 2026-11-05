@@ -28,6 +28,27 @@ NyoAnime v2.3 includes three primary subsystems:
 
 Communication between client and relay happens exclusively over WebSockets (ws:// or wss://). The relay never exposes MPV sockets; it only forwards high-level synchronization messages.
 
+## One-Click Zero-Config Setup
+
+Run the following command from the repository root to set up and launch NyoAnime automatically:
+
+### Linux / macOS:
+```bash
+./run.sh
+```
+
+### Windows:
+```bash
+run.bat
+```
+
+This script will:
+1. Create a virtual environment if one doesn't exist
+2. Install all required dependencies
+3. Launch the NyoAnime interface
+
+The app includes both the anime player and Watch Together multiplayer features.
+
 ## Quick Start (Local Network)
 
 1. Install NyoAnime (ensure `websockets` is available; the installer will auto-install it):

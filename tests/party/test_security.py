@@ -6,13 +6,13 @@ from nyoanime.party.rooms import RoomManager
 from nyoanime.party.models import RoomSettings, Participant, Role
 
 def test_room_code_uniqueness():
-    # Ensure generated codes are unique across many creations
+    # Codes are unique against live rooms, not against every code ever drawn.
     manager = RoomManager()
     codes = set()
-    for _ in range(1000):
-        code = manager._generate_room_code()
-        assert code not in codes
-        codes.add(code)
+    for idx in range(1000):
+        room = manager.create_room(host_id=f"host-{idx}")
+        assert room.id not in codes
+        codes.add(room.id)
 
 def test_participant_token_randomness():
     # Tokens should be long enough and unpredictable

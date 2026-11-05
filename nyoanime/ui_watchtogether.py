@@ -1,0 +1,2444 @@
+"""
+Watch Together TUI screens for NyoAnime.
+
+The room screen owns a live ``WTRClient`` for as long as the room is open. It
+polls keys without blocking the event loop so Supabase Realtime can keep
+delivering presence and broadcast events while the user reads the screen.
+
+The visual language follows NyoAnime's centered logo + panel + keycap-dock
+screens, with the simple host/join flow and member markers from the original
+ani-cli-ar Watch Together UI.
+"""
+
+import asyncio
+import base64
+import getpass
+import logging
+import os
+import re
+import sys
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+
+from rich.align import Align
+from rich.cells import cell_len
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.box import HEAVY
+
+from . import config as config_module
+from .config import (
+    COLOR_ACCENT,
+    COLOR_BOLT,
+    COLOR_BORDER,
+    COLOR_ERROR,
+    COLOR_HIGHLIGHT_BG,
+    COLOR_HIGHLIGHT_FG,
+    COLOR_PROMPT,
+    COLOR_SECONDARY_TEXT,
+    COLOR_SUBTITLE,
+    COLOR_SUCCESS,
+    COLOR_TITLE,
+    BOUNCING_BAR_FRAMES,
+)
+from .party.client import PartyClientError, WTRClient
+from .party.mpv_controller import MPVController
+from .party.protocol import PartyEvent, sanitize_diagnostic
+from .party.supabase_config import SupabaseConfigError
+from .party.sync import SyncEngine, SyncState
+from .utils import RawTerminal, get_key
+
+logger = logging.getLogger(__name__)
+
+_THEME_COLORS = (
+    "COLOR_ACCENT",
+    "COLOR_BOLT",
+    "COLOR_BORDER",
+    "COLOR_ERROR",
+    "COLOR_HIGHLIGHT_BG",
+    "COLOR_HIGHLIGHT_FG",
+    "COLOR_PROMPT",
+    "COLOR_SECONDARY_TEXT",
+    "COLOR_SUBTITLE",
+    "COLOR_SUCCESS",
+    "COLOR_TITLE",
+)
+
+
+def _sync_theme_colors() -> None:
+    """Pick up theme changes made while the app was running."""
+    for name in _THEME_COLORS:
+        value = getattr(config_module, name, None)
+        if value:
+            globals()[name] = value
+
+
+_CODE_LEN = 6
+_STATE_REFRESH_SECONDS = 5.0
+_STATUS_POLL_SECONDS = 0.06
+_RECONNECT_RETRY_SECONDS = 4.0
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+class _RoomPlayback:
+    """Owns the room's MPV/SyncEngine pair and swaps episodes safely."""
+
+    def __init__(self, role: str, send_callback=None, on_error=None):
+        self.role = "host" if str(role).lower() == "host" else "guest"
+        self.send_callback = send_callback
+        self.on_error = on_error
+        self.mpv: Optional[MPVController] = None
+        self.sync: Optional[SyncEngine] = None
+        self.stream_key: Optional[str] = None
+
+    @property
+    def active(self) -> bool:
+        return self.sync is not None
+
+    async def start(self, playback: Dict[str, Any], reference: Dict[str, Any]) -> None:
+        if not isinstance(playback, dict):
+            raise ValueError("No stream was resolved for this episode")
+        url = str(playback.get("url") or playback.get("stream_url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("The picked episode has no playable stream URL")
+
+        await self.stop()
+        self.mpv = MPVController(host=self.role == "host")
+        self.sync = SyncEngine(
+            self.mpv,
+            role=self.role,
+            send_callback=self.send_callback,
+            anime_reference=reference,
+        )
+        self.sync.on_error = self._handle_sync_error
+
+        try:
+            await self.mpv.connect(
+                url=url,
+                title=str(playback.get("title") or reference.get("title") or "Watch Together"),
+                start_time=float(playback.get("start_time") or 0.0),
+                audio_lang=playback.get("audio_lang") or None,
+                headers=playback.get("headers") or None,
+                subtitle_url=playback.get("subtitle_url") or None,
+                subtitle_lang=playback.get("subtitle_lang") or None,
+                audio_url=playback.get("audio_url") or None,
+                subtitles_disabled=bool(playback.get("subtitles_disabled", False)),
+                hls_bitrate=int(playback.get("hls_bitrate") or 0) or None,
+            )
+            if self.role == "host":
+                try:
+                    await self.sync.host_start_playback()
+                except Exception as exc:
+                    # MPV is already open. A dropped control channel must not
+                    # close it; the heartbeat loop retries once the room is back.
+                    self._handle_sync_error(exc)
+            else:
+                self.sync.set_state(SyncState.READY)
+            self.stream_key = url
+        except Exception:
+            await self.stop()
+            raise
+
+    async def apply_sync(self, payload: Dict[str, Any]) -> None:
+        if self.sync is not None:
+            await self.sync.apply_host_state(payload)
+
+    async def stop(self) -> None:
+        sync, self.sync = self.sync, None
+        self.mpv = None
+        self.stream_key = None
+        if sync is not None:
+            try:
+                await sync.stop()
+            except Exception:
+                pass
+
+    def _handle_sync_error(self, exc: Exception) -> None:
+        if self.on_error is not None:
+            self.on_error(exc)
+
+
+class WatchTogetherUI:
+    """UI components and session ownership for Watch Together."""
+
+    def __init__(
+        self,
+        console: Any,
+        client_factory: Optional[Callable[[str], WTRClient]] = None,
+        browse_callback: Optional[Callable[[Any], Optional[Dict[str, Any]]]] = None,
+    ):
+        # Accept either a Console (tests, embedders) or NyoAnime's UIManager so
+        # the Watch Together screens can reuse the same logo and theme.
+        self.ui = console if hasattr(console, "console") else None
+        self.console: Console = getattr(console, "console", console)
+        self._client_factory = client_factory or self._default_client_factory
+        # The app injects its existing search/anime/episode menus here. The
+        # callback receives the provider and returns an anime/episode dict (or
+        # None when the user backs out), while this screen keeps the room alive.
+        self._browse_callback = browse_callback
+        self._api = None
+        # Set when the room screen is closed with [q]; the session loop uses it
+        # to leave Watch Together instead of falling back to its menu.
+        self._quit_requested = False
+        _sync_theme_colors()
+
+    # ------------------------------------------------------------------
+    # Session entry point
+    # ------------------------------------------------------------------
+    def handle_watch_together(self, api) -> None:
+        """Run the whole Watch Together session on one event loop."""
+        self._api = api
+        self._quit_requested = False
+        asyncio.run(self._session_loop(api))
+
+    async def _session_loop(self, api) -> None:
+        notice = ""
+        while True:
+            choice = self.watch_together_menu(notice=notice)
+            notice = ""
+
+            if choice == "host":
+                _, notice = await self._create_room_flow()
+            elif choice == "join":
+                _, notice = await self._join_room_flow()
+            else:
+                return
+            if self._quit_requested:
+                return
+
+    # ------------------------------------------------------------------
+    # Menus and shared rendering
+    # ------------------------------------------------------------------
+    def watch_together_menu(self, notice: str = "") -> str:
+        name = self._nickname()
+        options = [
+            {
+                "label": "Host a room",
+                "description": "Create a room and share its code.",
+                "action": "host",
+            },
+            {
+                "label": "Join a room",
+                "description": "Enter a friend's six-digit code.",
+                "action": "join",
+            },
+            {
+                "label": "Back",
+                "description": "Return to the main menu.",
+                "action": "back",
+            },
+        ]
+        return self._choice_screen(
+            badge="Watch Together",
+            subtitle="Watch the same episode with friends.",
+            options=options,
+            notice=notice,
+            footer=f"You'll appear as {name}.",
+            panel_title="What would you like to do?",
+        )
+
+    def _error_screen(self, title: str, message: str, retry: bool = True) -> str:
+        options = []
+        if retry:
+            options.append({
+                "label": "Try again",
+                "description": "Retry the connection.",
+                "action": "retry",
+            })
+        options.append({
+            "label": "Back",
+            "description": "Return to Watch Together.",
+            "action": "back",
+        })
+        return self._choice_screen(
+            badge="Watch Together",
+            subtitle="",
+            options=options,
+            message=message,
+            panel_title=title,
+            border_style=COLOR_ERROR,
+        )
+
+    def _choice_screen(
+        self,
+        badge: str,
+        subtitle: str,
+        options: Sequence[Dict[str, str]],
+        *,
+        notice: str = "",
+        footer: str = "",
+        message: str = "",
+        panel_title: Optional[str] = None,
+        border_style: Optional[str] = None,
+        selected: int = 0,
+    ) -> str:
+        if not options:
+            return "back"
+
+        selected = max(0, min(selected, len(options) - 1))
+        border_style = border_style or COLOR_BORDER
+
+        def generate_renderable():
+            box_width = self._panel_width(72 if message else 64)
+            inner_width = max(16, box_width - 6)
+            compact = inner_width < 48
+
+            # Align.center propagates its justify into nested panels; force
+            # left alignment so menu rows read like a list, not centered pills.
+            content = Text(justify="left")
+            if message:
+                content.append(message.strip() + "\n\n", style="white")
+            for idx, option in enumerate(options):
+                if idx:
+                    content.append("\n")
+                content.append_text(
+                    self._option_row(
+                        option, idx == selected, inner_width, compact
+                    )
+                )
+
+            title_text = (
+                self._truncate(panel_title, max(8, box_width - 8))
+                if panel_title else None
+            )
+            panel = Panel(
+                content,
+                title=(
+                    f"[bold {border_style}]{title_text}[/bold {border_style}]"
+                    if title_text else None
+                ),
+                box=HEAVY,
+                border_style=border_style,
+                padding=(1, 2),
+                width=box_width,
+            )
+
+            notice_text = (
+                Text(f"› {notice}", style=f"bold {COLOR_TITLE}", justify="center")
+                if notice else None
+            )
+            footer_text = (
+                Text(footer, style=f"dim {COLOR_SECONDARY_TEXT}", justify="center")
+                if footer else None
+            )
+            narrow = self.console.width < 52
+            dock = self._dock(
+                [
+                    ("↑↓" if narrow else "↑↓/jk", "move", COLOR_TITLE),
+                    ("↵", "select", COLOR_TITLE),
+                    ("b", "back", COLOR_ACCENT),
+                ],
+                separator=" · " if narrow else "   •   ",
+            )
+
+            return self._stack(
+                self._header(badge, subtitle),
+                None,
+                panel,
+                None,
+                notice_text,
+                footer_text,
+                None,
+                dock,
+            )
+
+        self.clear()
+        with RawTerminal():
+            with Live(
+                generate_renderable(),
+                console=self.console,
+                screen=True,
+                auto_refresh=False,
+                refresh_per_second=10,
+            ) as live:
+                while True:
+                    key = get_key()
+                    if key is None:
+                        time.sleep(0.02)
+                        continue
+
+                    if key in ("UP", "k", "K") and selected > 0:
+                        selected -= 1
+                        live.update(generate_renderable(), refresh=True)
+                    elif key in ("DOWN", "j", "J") and selected < len(options) - 1:
+                        selected += 1
+                        live.update(generate_renderable(), refresh=True)
+                    elif key == "ENTER":
+                        return options[selected].get("action", "back")
+                    elif key in ("b", "B", "q", "Q", "ESC", "LEFT"):
+                        return "back"
+                    elif key and key.isdigit():
+                        index = int(key) - 1
+                        if 0 <= index < len(options):
+                            return options[index].get("action", "back")
+
+    def _option_row(
+        self,
+        option: Dict[str, str],
+        selected: bool,
+        width: int,
+        compact: bool,
+    ) -> Text:
+        label = self._truncate(option.get("label", ""), width - 3)
+        description = option.get("description", "") if not compact else ""
+        lines = [f"▶  {label}" if selected else f"   {label}"]
+        if description:
+            lines.append(f"   {self._truncate(description, width - 3)}")
+
+        row = Text()
+        for idx, line in enumerate(lines):
+            if idx:
+                row.append("\n")
+            padded = line + " " * max(0, width - cell_len(line))
+            if selected:
+                row.append(padded, style=f"bold {COLOR_HIGHLIGHT_FG} on {COLOR_HIGHLIGHT_BG}")
+            elif idx == 0:
+                row.append(padded, style="white")
+            else:
+                row.append(padded, style=f"dim {COLOR_SECONDARY_TEXT}")
+        return row
+
+    def _header(self, badge: str, subtitle: str = ""):
+        table = Table.grid(expand=False)
+        table.add_column(justify="center")
+        if self.console.height >= 30:
+            table.add_row(Align.center(self._logo()))
+            table.add_row(Text(""))
+
+        badge_text = Text()
+        badge_text.append("[ ", style=f"bold {COLOR_BORDER}")
+        badge_text.append(badge, style="bold white")
+        badge_text.append(" ]", style=f"bold {COLOR_BORDER}")
+        table.add_row(Align.center(badge_text))
+
+        if subtitle:
+            subtitle = self._truncate(subtitle, max(10, self.console.width - 4))
+            table.add_row(Align.center(Text(
+                subtitle, style=f"dim {COLOR_SECONDARY_TEXT}", justify="center"
+            )))
+        return table
+
+    def _logo(self, frame_idx: int = 0):
+        if self.ui is not None and hasattr(self.ui, "_get_logo"):
+            try:
+                logo = self.ui._get_logo(frame_idx)
+                if self.console.measure(logo).maximum <= self.console.width - 2:
+                    return logo
+            except Exception:
+                pass
+        return Text("NyoAnime", style=f"bold {COLOR_TITLE}")
+
+    def _stack(self, *items):
+        table = Table.grid(expand=False)
+        table.add_column(justify="center")
+        for item in items:
+            if item is None:
+                table.add_row(Text(""))
+            else:
+                table.add_row(Align.center(item))
+        return Align.center(table, vertical="middle", height=self.console.height)
+
+    def _dock(
+        self,
+        entries: Sequence[Tuple[str, str, str]],
+        separator: str = "   •   ",
+    ) -> Text:
+        dock = Text()
+        line_width = 0
+        limit = max(16, self.console.width - 4)
+        for idx, (key, label, color) in enumerate(entries):
+            segment_len = cell_len(f"[{key}] {label}")
+            if idx:
+                if line_width + cell_len(separator) + segment_len > limit:
+                    dock.append("\n")
+                    line_width = 0
+                else:
+                    dock.append(separator, style=f"bold {COLOR_BORDER}")
+                    line_width += cell_len(separator)
+            dock.append("[", style=f"bold {COLOR_BORDER}")
+            dock.append(key, style=f"bold {color}")
+            dock.append("]", style=f"bold {COLOR_BORDER}")
+            dock.append(f" {label}", style="white")
+            line_width += segment_len
+        return dock
+
+    def _panel_width(self, maximum: int = 72) -> int:
+        return max(24, min(maximum, self.console.width - 4))
+
+    @staticmethod
+    def _truncate(text: str, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        text = str(text)
+        if cell_len(text) <= limit:
+            return text
+        if limit <= 1:
+            return "…"
+        out = ""
+        for ch in text:
+            if cell_len(out + ch) > limit - 1:
+                break
+            out += ch
+        return out + "…"
+
+    # ------------------------------------------------------------------
+    # Identity and client construction
+    # ------------------------------------------------------------------
+    def _nickname(self) -> str:
+        try:
+            raw = os.environ.get("NYOANIME_WATCH_TOGETHER_NAME") or getpass.getuser()
+        except Exception:
+            raw = ""
+        name = " ".join(str(raw or "").split())
+        name = re.sub(r"[\x00-\x1f]", "", name).strip()
+        if len(name) > 32:
+            name = name[:32].rstrip()
+        return name or "Guest"
+
+    def _default_client_factory(self, nickname: str) -> WTRClient:
+        return WTRClient(self._get_relay_url(), nickname=nickname)
+
+    def _get_relay_url(self) -> str:
+        return "ws://localhost:8765"
+
+    # ------------------------------------------------------------------
+    # Join code entry
+    # ------------------------------------------------------------------
+    def _code_entry_screen(self, initial_code: str = "", notice: str = "") -> Optional[str]:
+        code = "".join(ch for ch in initial_code if ch.isdigit())[:_CODE_LEN]
+        message = notice
+        name = self._nickname()
+
+        def generate_renderable():
+            box_width = self._panel_width(54)
+            inner_width = max(16, box_width - 6)
+            gap = "   " if inner_width >= 34 else "  " if inner_width >= 26 else " "
+            rule_width = min(
+                3, max(1, (inner_width - 5 * cell_len(gap)) // _CODE_LEN)
+            )
+            rule = "─" * rule_width
+            digits = Text(justify="center")
+            rules = Text(justify="center")
+            for idx in range(_CODE_LEN):
+                if idx:
+                    digits.append(gap)
+                    rules.append(gap)
+                if idx < len(code):
+                    digits.append(code[idx], style=f"bold {COLOR_TITLE}")
+                else:
+                    digits.append("·", style=f"dim {COLOR_SECONDARY_TEXT}")
+                rules.append(rule, style=f"dim {COLOR_BORDER}")
+
+            body = Text(justify="center")
+            body.append("ROOM CODE\n\n", style=f"bold {COLOR_SUBTITLE}")
+            body.append_text(digits)
+            body.append("\n")
+            body.append_text(rules)
+            body.append("\n\n")
+
+            if message:
+                body.append(message, style=f"bold {COLOR_ERROR}")
+            elif len(code) == _CODE_LEN:
+                body.append(
+                    "Press Enter to join.",
+                    style=f"bold {COLOR_SUCCESS}",
+                )
+            else:
+                body.append(
+                    "Type the host's six-digit code.",
+                    style=f"dim {COLOR_SECONDARY_TEXT}",
+                )
+
+            panel = Panel(
+                body,
+                title=f"[bold {COLOR_TITLE}]Join a room[/bold {COLOR_TITLE}]",
+                box=HEAVY,
+                border_style=COLOR_BORDER,
+                padding=(0, 2) if self.console.height < 24 else (1, 2),
+                width=box_width,
+            )
+            dock = self._dock(
+                [
+                    ("0-9", "type", COLOR_TITLE),
+                    ("⌫", "delete", COLOR_TITLE),
+                    ("↵", "join", COLOR_TITLE),
+                    ("b", "back", COLOR_ACCENT),
+                ],
+                separator=" · " if self.console.width < 70 else "   •   ",
+            )
+            return self._stack(
+                self._header(
+                    "Watch Together",
+                    "Enter the host's six-digit code.",
+                ),
+                None,
+                panel,
+                None,
+                Text(f"You'll join as {name}.", style=f"dim {COLOR_SECONDARY_TEXT}", justify="center"),
+                None,
+                dock,
+            )
+
+        self.clear()
+        with RawTerminal():
+            with Live(
+                generate_renderable(),
+                console=self.console,
+                screen=True,
+                auto_refresh=False,
+                refresh_per_second=10,
+            ) as live:
+                while True:
+                    key = get_key()
+                    if key is None:
+                        time.sleep(0.02)
+                        continue
+
+                    changed = False
+                    if key in ("ESC", "b", "B", "q", "Q", "LEFT"):
+                        return None
+                    if key == "ENTER":
+                        if len(code) == _CODE_LEN:
+                            return code
+                        message = "Room codes are six digits."
+                        changed = True
+                    elif key == "BACKSPACE":
+                        if code:
+                            code = code[:-1]
+                        message = ""
+                        changed = True
+                    elif key:
+                        digits = "".join(ch for ch in str(key) if ch.isdigit())
+                        if digits:
+                            code = (code + digits)[:_CODE_LEN]
+                            message = ""
+                            changed = True
+
+                    if changed:
+                        live.update(generate_renderable(), refresh=True)
+
+    # ------------------------------------------------------------------
+    # Create / join flows
+    # ------------------------------------------------------------------
+    async def _create_room_flow(self) -> Tuple[bool, str]:
+        nickname = self._nickname()
+        import sys
+        import traceback
+
+        while True:
+            client = self._client_factory(nickname)
+            try:
+                await self._run_steps([
+                    ("Connecting to Watch Together...", lambda c=client: c.connect()),
+                    ("Opening your room...", lambda c=client: c.create_room()),
+                ])
+            except KeyboardInterrupt:
+                await self._emergency_leave(client)
+                await self._safe_close(client)
+                raise
+            except Exception as exc:
+                print(f"[ERROR] Watch Together room creation failed:\n{traceback.format_exc()}", file=sys.stderr)
+                logger.warning(
+                    "Watch Together create failed: %s: %s",
+                    type(exc).__name__,
+                    sanitize_diagnostic(str(exc)),
+                )
+                title, message, technical = self._friendly_error(exc, "create")
+                if getattr(client, "room_active", False):
+                    left = await self._guard_room_screen(
+                        client,
+                        initial_error=message,
+                        technical_error=technical,
+                        notice="Your room code is ready. Share it with friends.",
+                    )
+                    return left, "You left the room." if left else ""
+                await self._safe_close(client)
+                action = self._error_screen(
+                    title, message, retry=self._can_retry(exc)
+                )
+                if action == "retry":
+                    continue
+                return False, ""
+
+            left = await self._guard_room_screen(
+                client,
+                notice="Your room is ready. Share the code with friends.",
+            )
+            return left, "You left the room." if left else ""
+
+    async def _join_room_flow(self) -> Tuple[bool, str]:
+        nickname = self._nickname()
+        code = self._code_entry_screen()
+        import sys
+        import traceback
+
+        while code:
+            client = self._client_factory(nickname)
+            try:
+                await self._run_steps([
+                    ("Connecting to Watch Together...", lambda c=client: c.connect()),
+                    (f"Joining room {code}...", lambda c=client, r=code: c.join_room(r)),
+                ])
+            except KeyboardInterrupt:
+                await self._emergency_leave(client)
+                await self._safe_close(client)
+                raise
+            except Exception as exc:
+                print(f"[ERROR] Watch Together room join failed:\n{traceback.format_exc()}", file=sys.stderr)
+                logger.warning(
+                    "Watch Together join failed: %s: %s",
+                    type(exc).__name__,
+                    sanitize_diagnostic(str(exc)),
+                )
+                title, message, technical = self._friendly_error(exc, "join")
+                if getattr(client, "room_active", False):
+                    left = await self._guard_room_screen(
+                        client,
+                        initial_error=message,
+                        technical_error=technical,
+                        notice="You're in the room.",
+                    )
+                    return left, "You left the room." if left else ""
+                await self._safe_close(client)
+                if self._is_code_error(exc):
+                    # Typos go straight back to the slots; no extra error screen.
+                    code = self._code_entry_screen(initial_code=code, notice=message)
+                    continue
+                if self._error_screen(
+                    title, message, retry=self._can_retry(exc)
+                ) != "retry":
+                    return False, ""
+
+            else:
+                left = await self._guard_room_screen(
+                    client,
+                    notice="You're in. Waiting for the host to start.",
+                )
+                return left, "You left the room." if left else ""
+
+        return False, ""
+
+    async def _guard_room_screen(
+        self,
+        client: WTRClient,
+        initial_error: Optional[str] = None,
+        technical_error: Optional[str] = None,
+        notice: Optional[str] = None,
+    ) -> bool:
+        """Always attempt a server-side leave before dropping the client."""
+        try:
+            return await self._room_screen(
+                client,
+                initial_error=initial_error,
+                technical_error=technical_error,
+                notice=notice,
+            )
+        except KeyboardInterrupt:
+            await self._emergency_leave(client)
+            raise
+        except Exception:
+            await self._emergency_leave(client)
+            raise
+        finally:
+            await self._safe_close(client)
+
+    async def _safe_close(self, client: WTRClient) -> None:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    async def _emergency_leave(self, client: WTRClient) -> None:
+        if not getattr(client, "room_active", False):
+            return
+        try:
+            await asyncio.wait_for(client.leave_room(), timeout=12.0)
+        except Exception as exc:
+            logger.warning("Emergency leave failed: %s", exc)
+            body = Text(justify="center")
+            body.append(
+                "We couldn't confirm that you left the room.\n\n",
+                style="bold white",
+            )
+            body.append(
+                "Open Watch Together again and use Leave room to try again.",
+                style="white",
+            )
+            self.clear()
+            self.console.print(self._stack(
+                self._header("Watch Together"),
+                None,
+                Panel(
+                    body,
+                    title=f"[bold {COLOR_ERROR}]Room may still be open[/bold {COLOR_ERROR}]",
+                    box=HEAVY,
+                    border_style=COLOR_ERROR,
+                    padding=(1, 2),
+                    width=self._panel_width(60),
+                ),
+            ))
+            self._pause("Press any key to continue...")
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+    async def _run_steps(
+        self,
+        steps: Sequence[Tuple[str, Callable[[], Awaitable[Any]]]],
+    ) -> Any:
+        if not steps:
+            return None
+
+        index = 0
+        frame = 0
+        task = asyncio.ensure_future(steps[0][1]())
+        try:
+            with Live(
+                self._loading_view(steps[0][0], frame),
+                console=self.console,
+                screen=True,
+                refresh_per_second=15,
+                transient=True,
+            ) as live:
+                while True:
+                    if task.done():
+                        result = task.result()
+                        index += 1
+                        if index >= len(steps):
+                            return result
+                        task = asyncio.ensure_future(steps[index][1]())
+
+                    frame += 1
+                    live.update(
+                        self._loading_view(steps[index][0], frame),
+                        refresh=True,
+                    )
+                    await asyncio.sleep(0.07)
+        except BaseException:
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise
+        finally:
+            self.console.clear()
+
+    def _loading_view(self, message: str, frame: int):
+        frames = BOUNCING_BAR_FRAMES or ["[...]"]
+        bar = Text(frames[frame % len(frames)], style=f"bold {COLOR_BOLT}")
+
+        body = Table.grid(expand=False)
+        body.add_column(justify="center")
+        body.add_row(Align.center(bar))
+        body.add_row(Text(""))
+        body.add_row(Align.center(Text(message, style="bold white")))
+        body.add_row(Align.center(Text(
+            "This only takes a moment.",
+            style=f"dim {COLOR_SECONDARY_TEXT}",
+        )))
+
+        panel = Panel(
+            body,
+            title=f"[bold {COLOR_TITLE}]Watch Together[/bold {COLOR_TITLE}]",
+            box=HEAVY,
+            border_style=COLOR_BORDER,
+            padding=(1, 4),
+            width=self._panel_width(58),
+        )
+        return self._stack(
+            self._header("Watch Together", "Watch the same episode with friends."),
+            None,
+            panel,
+        )
+
+    # ------------------------------------------------------------------
+    # Persistent room screen
+    # ------------------------------------------------------------------
+    async def _room_screen(
+        self,
+        client: WTRClient,
+        initial_error: Optional[str] = None,
+        technical_error: Optional[str] = None,
+        notice: Optional[str] = None,
+    ) -> bool:
+        self._quit_requested = False
+        state: Optional[Dict[str, Any]] = None
+        if hasattr(client, "local_room_state"):
+            try:
+                state = client.local_room_state()
+            except Exception:
+                state = None
+
+        state_error: Optional[str] = None
+        leave_error: Optional[str] = None
+        error = initial_error
+        technical = technical_error or getattr(client, "channel_error", None)
+        notice = notice or ""
+        notice_until = time.monotonic() + 4.0 if notice else 0.0
+        show_diagnostics = False
+        busy = ""
+        dirty = True
+        state_task: Optional[asyncio.Task] = None
+        last_status = None
+        last_size = (self.console.width, self.console.height)
+        next_refresh = time.monotonic()
+        left = False
+        selected_reference: Optional[Dict[str, str]] = None
+        selected_playback: Optional[Dict[str, Any]] = None
+        playback_task: Optional[asyncio.Task] = None
+        pending_share = False
+        was_ready = bool(getattr(client, "channels_ready", False))
+        subscriptions: List[Tuple[str, Callable[[Any], None]]] = []
+        quit_requested = False
+        spinner_frame = 0
+        retry_task: Optional[asyncio.Task] = None
+        next_retry = time.monotonic() + _RECONNECT_RETRY_SECONDS
+
+        def model(current_notice: str = "", current_busy: str = ""):
+            live_error = getattr(client, "channel_error", None)
+            return self.room_view_model(
+                client,
+                state=state,
+                state_error=state_error,
+                notice=current_notice or notice,
+                leave_error=leave_error,
+                initial_error=error,
+                technical_error=live_error or technical,
+                show_diagnostics=show_diagnostics,
+                busy=current_busy or busy,
+                selection=selected_reference,
+                spinner_frame=spinner_frame,
+            )
+
+        def set_notice(value: str) -> None:
+            nonlocal notice, notice_until, dirty
+            notice = value
+            notice_until = time.monotonic() + 4.0 if value else 0.0
+            dirty = True
+
+        async def send_sync(payload: Dict[str, Any]) -> None:
+            await client.send_event(PartyEvent.SYNC_PLAYBACK.value, payload)
+
+        playback = _RoomPlayback(
+            getattr(client, "role", "guest"),
+            send_callback=send_sync,
+            on_error=lambda exc: set_notice(self._playback_error_notice(exc)),
+        )
+
+        def queue_playback(
+            current_playback: Optional[Dict[str, Any]],
+            reference: Optional[Dict[str, Any]],
+        ) -> None:
+            nonlocal playback_task, busy, dirty
+            if not current_playback or not isinstance(reference, dict):
+                return
+            if playback_task is not None and not playback_task.done():
+                playback_task.cancel()
+            busy = "Resolving stream & launching MPV..."
+            playback_task = asyncio.create_task(
+                playback.start(current_playback, reference)
+            )
+            dirty = True
+
+        def on_episode_changed(message: Any) -> None:
+            nonlocal selected_reference, selected_playback, playback_task, dirty
+            reference = self._reference_from_message(message)
+            if not reference:
+                return
+            selected_reference = reference
+            incoming_playback = self._playback_from_message(message)
+            if str(getattr(client, "role", "guest") or "guest").lower() != "host":
+                set_notice(f"Host picked: {self._selection_label(reference)}")
+                if incoming_playback:
+                    selected_playback = incoming_playback
+                    queue_playback(incoming_playback, reference)
+                else:
+                    selected_playback = None
+                    if playback_task is not None and not playback_task.done():
+                        playback_task.cancel()
+                    playback_task = None
+                    asyncio.create_task(playback.stop())
+            else:
+                dirty = True
+            if incoming_playback:
+                selected_playback = incoming_playback
+
+        def on_sync_playback(message: Any) -> None:
+            payload = (
+                message.get("payload")
+                if isinstance(message, dict)
+                else getattr(message, "payload", None)
+            )
+            if isinstance(payload, dict) and playback.active:
+                asyncio.create_task(playback.apply_sync(payload))
+
+        def on_room_state(message: Any) -> None:
+            # Relay rooms carry the current pick in room state; adopt it quietly
+            # so re-joining guests see what the host already chose.
+            nonlocal selected_reference, dirty
+            reference = self._reference_from_message(message)
+            if reference and reference != selected_reference:
+                selected_reference = reference
+                dirty = True
+
+        async def share_selection() -> bool:
+            nonlocal pending_share
+            reference = selected_reference
+            if (
+                reference is None
+                or not getattr(client, "channels_ready", False)
+                or not hasattr(client, "send_event")
+            ):
+                pending_share = True
+                return False
+            label = self._selection_label(reference)
+            payload: Dict[str, Any] = {"anime_reference": reference}
+            broadcast_playback = self._broadcast_playback(selected_playback)
+            if broadcast_playback:
+                payload["playback"] = broadcast_playback
+                payload["stream_url"] = broadcast_playback.get("url")
+                payload["title"] = (
+                    broadcast_playback.get("title") or reference.get("title")
+                )
+                payload["episode_number"] = (
+                    broadcast_playback.get("episode_number")
+                    or reference.get("episode_number")
+                )
+                if broadcast_playback.get("headers"):
+                    payload["headers"] = broadcast_playback["headers"]
+            try:
+                broadcaster = getattr(client, "broadcast_playback", None)
+                if broadcast_playback and callable(broadcaster):
+                    await broadcaster(broadcast_playback, reference)
+                else:
+                    await client.send_event(
+                        PartyEvent.EPISODE_CHANGED.value, payload
+                    )
+            except Exception as exc:
+                _, message, _ = self._friendly_error(exc, "room")
+                logger.warning("Watch Together selection broadcast failed: %s", message)
+                pending_share = True
+                set_notice(
+                    "Picked it. Will share when the connection returns."
+                    if self.console.width < 56
+                    else f"Picked {label}, but couldn't share it yet. "
+                    "It will be shared automatically when the room reconnects."
+                )
+                return False
+            pending_share = False
+            set_notice(
+                f"Shared: {label}"
+                if self.console.width < 56
+                else f"Room pick shared: {label}."
+            )
+            return True
+
+        if hasattr(client, "subscribe"):
+            for event, handler in (
+                (PartyEvent.EPISODE_CHANGED.value, on_episode_changed),
+                (PartyEvent.ROOM_STATE.value, on_room_state),
+                (PartyEvent.SYNC_PLAYBACK.value, on_sync_playback),
+            ):
+                try:
+                    client.subscribe(event, handler)
+                    subscriptions.append((event, handler))
+                except Exception:
+                    pass
+
+        # Realtime broadcast is best-effort; the persisted room state is the
+        # fallback when a frame is dropped or the channel write is rejected.
+        start_poll = getattr(client, "start_playback_poll", None)
+        if callable(start_poll):
+            try:
+                start_poll()
+            except Exception:
+                pass
+
+        try:
+            with RawTerminal():
+                with Live(
+                    self._build_room_view(model(), show_diagnostics),
+                    console=self.console,
+                    screen=True,
+                    auto_refresh=False,
+                    refresh_per_second=6,
+                ) as live:
+                    if getattr(client, "room_active", False):
+                        state_task = asyncio.create_task(client.get_room_state())
+
+                    try:
+                        while True:
+                            now = time.monotonic()
+
+                            if notice and notice_until and now >= notice_until:
+                                notice = ""
+                                notice_until = 0.0
+                                dirty = True
+
+                            if state_task is not None and state_task.done():
+                                try:
+                                    state = state_task.result()
+                                    state_error = None
+                                    if notice.startswith(("Refreshing", "We couldn't refresh")):
+                                        set_notice("")
+                                except Exception as exc:
+                                    state_error = self._describe_error(exc)
+                                    if not notice:
+                                        set_notice(
+                                            "We couldn't refresh the member list. "
+                                            "Press [r] to try again."
+                                        )
+                                state_task = None
+                                next_refresh = now + _STATE_REFRESH_SECONDS
+                                dirty = True
+
+                            if (
+                                state_task is None
+                                and getattr(client, "channels_ready", False)
+                                and now >= next_refresh
+                            ):
+                                state_task = asyncio.create_task(client.get_room_state())
+                                next_refresh = now + _STATE_REFRESH_SECONDS
+
+                            if retry_task is not None and retry_task.done():
+                                try:
+                                    retry_task.result()
+                                except Exception:
+                                    pass
+                                retry_task = None
+                                next_retry = now + _RECONNECT_RETRY_SECONDS
+                                dirty = True
+
+                            if playback_task is not None and playback_task.done():
+                                try:
+                                    playback_task.result()
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception as exc:
+                                    set_notice(self._playback_error_notice(exc))
+                                playback_task = None
+                                busy = ""
+                                dirty = True
+
+                            ready_now = bool(getattr(client, "channels_ready", False))
+                            if (
+                                retry_task is None
+                                and not ready_now
+                                and not busy
+                                and getattr(client, "room_active", False)
+                                and now >= next_retry
+                            ):
+                                # Recover from dropped sockets in the background so
+                                # the room never blocks on a scary error screen.
+                                retry_task = asyncio.create_task(
+                                    client.retry_connection()
+                                )
+                                next_retry = now + _RECONNECT_RETRY_SECONDS
+
+                            if busy or not ready_now:
+                                spinner_frame = int(now * 9)
+
+                            if getattr(client, "channels_ready", False) and error:
+                                error = None
+                                technical = getattr(client, "channel_error", None) or technical
+                                if not notice:
+                                    set_notice("Connected again.")
+                                dirty = True
+
+                            if ready_now and not was_ready and pending_share:
+                                # Reconnected after a pick: deliver the queued selection.
+                                await share_selection()
+                            elif ready_now and not was_ready and not notice:
+                                set_notice("Connected again.")
+                            was_ready = ready_now
+
+                            current_status = (
+                                bool(getattr(client, "connected", False)),
+                                bool(getattr(client, "channels_ready", False)),
+                                getattr(client, "channel_error", None),
+                                busy,
+                                show_diagnostics,
+                                error,
+                                leave_error,
+                                notice,
+                                len((state or {}).get("participants") or []),
+                                selected_reference,
+                                spinner_frame,
+                            )
+                            if current_status != last_status:
+                                last_status = current_status
+                                dirty = True
+
+                            size = (self.console.width, self.console.height)
+                            if size != last_size:
+                                last_size = size
+                                dirty = True
+
+                            if dirty:
+                                live.update(
+                                    self._build_room_view(model(), show_diagnostics),
+                                    refresh=True,
+                                )
+                                dirty = False
+
+                            key = get_key()
+
+                            if key in ("l", "L", "q", "Q"):
+                                wants_quit = key in ("q", "Q")
+                                if playback_task is not None and not playback_task.done():
+                                    playback_task.cancel()
+                                    try:
+                                        await playback_task
+                                    except (asyncio.CancelledError, Exception):
+                                        pass
+                                playback_task = None
+                                busy = "Leaving the room..."
+                                await playback.stop()
+                                leave_task = asyncio.create_task(client.leave_room())
+                                frame = 0
+                                while not leave_task.done():
+                                    frame += 1
+                                    live.update(
+                                        self._build_room_view(
+                                            model(current_busy="Leaving the room..."),
+                                            show_diagnostics,
+                                        ),
+                                        refresh=True,
+                                    )
+                                    await asyncio.sleep(0.08)
+                                busy = ""
+                                try:
+                                    leave_task.result()
+                                except Exception as exc:
+                                    _, message, technical = self._friendly_error(exc, "leave")
+                                    leave_error = message
+                                    set_notice("")
+                                else:
+                                    left = True
+                                    quit_requested = wants_quit
+                                    break
+
+                            elif key in ("b", "B"):
+                                is_host = str(
+                                    getattr(client, "role", "guest") or "guest"
+                                ).lower() == "host"
+                                if not is_host:
+                                    set_notice(
+                                        "Only the host picks the episode."
+                                        if self.console.width < 56
+                                        else "Only the host can choose what the room watches."
+                                    )
+                                elif self._browse_callback is None:
+                                    set_notice(
+                                        "Anime browsing isn't available here. "
+                                        "Press [l] to leave."
+                                    )
+                                else:
+                                    # Hand the terminal back to the normal menus,
+                                    # then restore the same room without a blank frame.
+                                    live.stop()
+                                    selection = None
+                                    browse_failed = False
+                                    try:
+                                        selection = await asyncio.to_thread(
+                                            self._browse_callback, self._api
+                                        )
+                                    except (KeyboardInterrupt, SystemExit):
+                                        raise
+                                    except Exception:
+                                        logger.error(
+                                            "Watch Together browse failed",
+                                            exc_info=True,
+                                        )
+                                        browse_failed = True
+                                    finally:
+                                        live.start()
+                                        live.update(
+                                            self._build_room_view(
+                                                model(), show_diagnostics
+                                            ),
+                                            refresh=True,
+                                        )
+                                        dirty = False
+
+                                    narrow = self.console.width < 56
+                                    if browse_failed:
+                                        set_notice(
+                                            "Couldn't open the browser. Room is still open."
+                                            if narrow
+                                            else "We couldn't open the anime browser. "
+                                            "Your room is still open."
+                                        )
+                                    elif not selection:
+                                        set_notice(
+                                            "Back in the room."
+                                            if narrow
+                                            else "Back in the room. Your room is still open."
+                                        )
+                                    else:
+                                        reference = self._selection_reference(selection)
+                                        if reference is None:
+                                            set_notice(
+                                                "That anime had no episode. Room is still open."
+                                                if narrow
+                                                else "That anime didn't have a usable episode. "
+                                                "Your room is still open."
+                                            )
+                                        else:
+                                            selected_reference = reference
+                                            selected_playback = self._playback_from_selection(
+                                                selection
+                                            )
+                                            if not await share_selection():
+                                                pending_share = True
+                                                if narrow:
+                                                    set_notice(
+                                                        "Picked it. Will share when the connection returns."
+                                                    )
+                                            playback_error = selection.get(
+                                                "playback_error"
+                                            )
+                                            if selected_playback:
+                                                queue_playback(
+                                                    selected_playback, reference
+                                                )
+                                            elif playback_error:
+                                                set_notice(str(playback_error))
+
+                            elif key in ("r", "R"):
+                                if getattr(client, "channels_ready", False):
+                                    if state_task is None:
+                                        set_notice("Refreshing members...")
+                                        state_task = asyncio.create_task(client.get_room_state())
+                                        next_refresh = time.monotonic() + _STATE_REFRESH_SECONDS
+                                    else:
+                                        set_notice("Members are already refreshing.")
+                                elif retry_task is None:
+                                    next_retry = time.monotonic()
+                                    set_notice("Reconnecting...")
+                                else:
+                                    set_notice("Already reconnecting.")
+
+                            elif key in ("c", "C"):
+                                code = getattr(client, "room_code", None)
+                                if code:
+                                    if self._copy_to_clipboard(str(code)):
+                                        set_notice("Room code copied.")
+                                    else:
+                                        set_notice("Copy isn't available here. Share the code manually.")
+                                else:
+                                    set_notice("There is no room code to copy yet.")
+
+                            elif key in ("i", "I"):
+                                show_diagnostics = not show_diagnostics
+                                set_notice("")
+
+                            elif key == "ESC":
+                                if show_diagnostics:
+                                    show_diagnostics = False
+                                    dirty = True
+                                else:
+                                    guest_hint = (
+                                        "Press [l] to leave, [i] for details, "
+                                        "or [q] to quit."
+                                    )
+                                    host_hint = (
+                                        "Press [b] to browse, [l] to leave, "
+                                        "[i] for details, or [q] to quit."
+                                    )
+                                    set_notice(
+                                        host_hint
+                                        if str(
+                                            getattr(client, "role", "guest")
+                                        ).lower() == "host"
+                                        else guest_hint
+                                    )
+
+                            await asyncio.sleep(_STATUS_POLL_SECONDS)
+                    finally:
+                        for task in (state_task, retry_task, playback_task):
+                            if task is not None:
+                                task.cancel()
+                                try:
+                                    await task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                        await playback.stop()
+        finally:
+            stop_poll = getattr(client, "stop_playback_poll", None)
+            if callable(stop_poll):
+                try:
+                    stop_poll()
+                except Exception:
+                    pass
+            if hasattr(client, "unsubscribe"):
+                for event, handler in subscriptions:
+                    try:
+                        client.unsubscribe(event, handler)
+                    except Exception:
+                        pass
+
+        self._quit_requested = quit_requested
+        return left
+
+    # ------------------------------------------------------------------
+    # Room view model
+    # ------------------------------------------------------------------
+    def room_view_model(
+        self,
+        client: Any,
+        state: Optional[Dict[str, Any]] = None,
+        state_error: Optional[str] = None,
+        notice: str = "",
+        leave_error: Optional[str] = None,
+        initial_error: Optional[str] = None,
+        technical_error: Optional[str] = None,
+        show_diagnostics: bool = False,
+        busy: str = "",
+        selection: Optional[Dict[str, Any]] = None,
+        spinner_frame: int = 0,
+    ) -> Dict[str, Any]:
+        role = str(getattr(client, "role", "guest") or "guest").lower()
+        role_label = "HOST" if role == "host" else "GUEST"
+        room_code = getattr(client, "room_code", None) or "—"
+        room_id = getattr(client, "room_id", None)
+        transport_kind = getattr(client, "transport_kind", "unknown")
+        connected = bool(getattr(client, "connected", False))
+        channels_ready = bool(getattr(client, "channels_ready", False))
+        channels = getattr(client, "channel_status", {}) or {}
+        channel_states = getattr(client, "channel_states", {}) or {}
+        channel_error = getattr(client, "channel_error", None)
+        participant_rows = self._participant_rows(client, state)
+        participants = [
+            f"{row['name']} ({row['role']})" for row in participant_rows
+        ]
+
+        reconnecting = False
+        if busy:
+            status = "CONNECTING"
+            status_label = busy
+            status_kind = "pending"
+        elif channels_ready:
+            status = "CONNECTED"
+            status_label = "Connected"
+            status_kind = "ok"
+        elif room_code != "—" or room_id:
+            # A dropped socket is recoverable: show a quiet spinner instead of
+            # taking over the screen or repainting the whole panel as an error.
+            status = "RECONNECTING"
+            status_label = "Reconnecting…"
+            status_kind = "pending"
+            reconnecting = True
+        else:
+            status = "NOT CONNECTED"
+            status_label = "Not connected"
+            status_kind = "error"
+
+        error = leave_error or initial_error
+        you = next((row for row in participant_rows if row["is_you"]), None)
+        you_name = you["name"] if you else getattr(client, "nickname", "")
+        host_name = next(
+            (row["name"] for row in participant_rows if row["role"] == "host"),
+            "",
+        )
+        if not host_name and role == "host":
+            host_name = you_name
+        code_display = (
+            " ".join(str(room_code)) if str(room_code).isdigit() else str(room_code)
+        )
+        share_hint = (
+            "Share this code so friends can join."
+            if room_code != "—"
+            else "Waiting for the room code..."
+        )
+
+        chosen = selection if isinstance(selection, dict) else {}
+        chosen_title = str(chosen.get("title") or "").strip()
+        chosen_episode = str(chosen.get("episode_number") or "").strip()
+        chosen_episode_title = str(chosen.get("episode_title") or "").strip()
+
+        diagnostics = {
+            "transport": transport_kind,
+            "room_id": room_id,
+            "channels": dict(channels) if isinstance(channels, dict) else {},
+            "channel_states": (
+                dict(channel_states) if isinstance(channel_states, dict) else {}
+            ),
+            "channel_error": channel_error,
+            "state_error": state_error,
+            "technical_error": technical_error,
+            "room_state_loaded": bool(state and state.get("participants")),
+        }
+
+        return {
+            "role": role_label,
+            "role_text": "You're hosting" if role == "host" else "You're a guest",
+            "is_host": role == "host",
+            "room_code": room_code,
+            "room_code_display": code_display,
+            "room_id": room_id,
+            "transport_kind": transport_kind,
+            "connected": connected,
+            "channels_ready": channels_ready,
+            "channels": diagnostics["channels"],
+            "channel_error": channel_error,
+            "status": status,
+            "status_label": status_label,
+            "status_kind": status_kind,
+            "reconnecting": reconnecting,
+            "spinner": _SPINNER_FRAMES[spinner_frame % len(_SPINNER_FRAMES)],
+            "participants": participants,
+            "participant_rows": participant_rows,
+            "participant_count": len(participant_rows),
+            "host_name": host_name,
+            "you_name": you_name,
+            "share_hint": share_hint,
+            "state_error": state_error,
+            "notice": notice,
+            "leave_error": leave_error,
+            "initial_error": initial_error,
+            "error": error,
+            "technical_error": technical_error,
+            "show_diagnostics": show_diagnostics,
+            "diagnostics": diagnostics,
+            "busy": busy,
+            "selection": chosen or None,
+            "selection_title": chosen_title,
+            "selection_episode": chosen_episode,
+            "selection_episode_title": chosen_episode_title,
+        }
+
+    def _participant_rows(
+        self, client: Any, state: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        you: Dict[str, Any] = {}
+
+        if isinstance(state, dict):
+            raw_you = state.get("you")
+            if isinstance(raw_you, dict):
+                you = raw_you
+            raw = state.get("participants")
+            if isinstance(raw, list):
+                candidates = [row for row in raw if isinstance(row, dict)]
+            elif isinstance(raw, dict):
+                for value in raw.values():
+                    if isinstance(value, dict):
+                        candidates.append(value)
+                    elif isinstance(value, list):
+                        candidates.extend(
+                            item for item in value if isinstance(item, dict)
+                        )
+
+        if not you and hasattr(client, "local_room_state"):
+            try:
+                local = client.local_room_state()
+                if isinstance(local, dict) and isinstance(local.get("you"), dict):
+                    you = local["you"]
+                    if not candidates and isinstance(local.get("participants"), list):
+                        candidates = [
+                            row for row in local["participants"]
+                            if isinstance(row, dict)
+                        ]
+            except Exception:
+                pass
+
+        you_pid = str(you.get("participant_id") or getattr(client, "participant_id", "") or "")
+        you_uid = str(you.get("user_id") or "")
+        you_name = str(
+            you.get("nickname") or getattr(client, "nickname", "") or "You"
+        )
+        you_role = str(
+            you.get("role") or getattr(client, "role", "guest") or "guest"
+        ).lower()
+        if you_role not in ("host", "guest"):
+            you_role = "guest"
+
+        rows: List[Dict[str, Any]] = []
+        seen_you = False
+        for row in candidates:
+            name = str(row.get("nickname") or row.get("name") or "Guest")
+            role = str(row.get("role") or "guest").lower()
+            if role not in ("host", "guest"):
+                role = "guest"
+            row_pid = str(row.get("id") or row.get("participant_id") or "")
+            row_uid = str(row.get("user_id") or "")
+            is_you = bool(
+                (you_pid and row_pid == you_pid)
+                or (you_uid and row_uid == you_uid)
+                or (not you_pid and not you_uid and name == you_name and not seen_you)
+            )
+            seen_you = seen_you or is_you
+            rows.append({
+                "name": name,
+                "role": role,
+                "is_you": is_you,
+                "is_host": role == "host",
+            })
+
+        if not any(row["is_you"] for row in rows):
+            rows.append({
+                "name": you_name,
+                "role": you_role,
+                "is_you": True,
+                "is_host": you_role == "host",
+            })
+
+        rows.sort(key=lambda row: (
+            0 if row["role"] == "host" else 1,
+            0 if row["is_you"] else 1,
+            row["name"].lower(),
+        ))
+        return rows
+
+    # ------------------------------------------------------------------
+    # Room rendering
+    # ------------------------------------------------------------------
+    def _build_room_view(self, model: Dict[str, Any], show_diagnostics: bool = False):
+        narrow = self.console.width < 56
+        very_tight = self.console.height < 24
+        if model["busy"]:
+            subtitle = ""
+        elif model["status_kind"] != "ok":
+            subtitle = (
+                "Reconnecting. You can leave."
+                if narrow
+                else "Trying to reconnect. You can leave at any time."
+            )
+        else:
+            subtitle = (
+                "Keep this screen open."
+                if narrow
+                else "Keep this screen open to stay in the room."
+            )
+        if very_tight:
+            subtitle = ""
+        if self.console.width < 36:
+            footer_text = "Stay here to keep it open."
+        elif narrow:
+            footer_text = "Stay here to keep the room open."
+        else:
+            footer_text = "Room stays open while this screen is open."
+        footer = Text(
+            footer_text,
+            style=f"dim {COLOR_SECONDARY_TEXT}",
+            justify="center",
+        )
+        header = self._header("Watch Together", subtitle)
+        panel = self._build_room_panel(model, show_diagnostics=show_diagnostics)
+        if very_tight:
+            return self._stack(header, panel)
+        if self.console.height < 32:
+            return self._stack(header, panel, footer)
+        return self._stack(header, None, panel, None, footer)
+
+    def _build_room_panel(
+        self, model: Dict[str, Any], show_diagnostics: bool = False
+    ) -> Panel:
+        box_width = self._panel_width(76)
+        inner_width = max(20, box_width - 6)
+        narrow = self.console.width < 56
+        compact = self.console.height < 24
+        content = Table.grid(expand=True)
+        content.add_column(justify="left")
+
+        # Role and connection status on one calm line.
+        left = Text()
+        if model["is_host"]:
+            left.append("● ", style=f"bold {COLOR_SUCCESS}")
+            left.append(model["role_text"], style="bold white")
+        else:
+            left.append("○ ", style=f"bold {COLOR_PROMPT}")
+            left.append(model["role_text"], style="bold white")
+
+        right = Text()
+        status_color = {
+            "ok": COLOR_SUCCESS,
+            "pending": COLOR_TITLE,
+            "error": COLOR_ERROR,
+        }.get(model["status_kind"], COLOR_SECONDARY_TEXT)
+        marker = (
+            model.get("spinner", "◌")
+            if model.get("reconnecting")
+            else ("●" if model["status_kind"] == "ok" else "◌")
+        )
+        right.append(f"{marker} ", style=f"bold {status_color}")
+        right.append(model["status_label"], style=f"bold {status_color}")
+
+        status_row = Table.grid(expand=True)
+        if inner_width >= 44:
+            status_row.add_column(justify="left", ratio=1)
+            status_row.add_column(justify="right")
+            status_row.add_row(left, right)
+        else:
+            # Two columns squeeze the role on narrow terminals; stack instead.
+            status_row.add_column(justify="left")
+            status_row.add_row(left)
+            status_row.add_row(right)
+        content.add_row(status_row)
+
+        if not (compact and model["selection_title"]):
+            content.add_row(Text(""))
+        content.add_row(Text(
+            "ROOM CODE",
+            style=f"bold {COLOR_SUBTITLE}",
+            justify="center",
+        ))
+        content.add_row(Text(
+            model["room_code_display"],
+            style=f"bold {COLOR_TITLE}",
+            justify="center",
+        ))
+
+        host_line = Text(justify="center")
+        host_line.append("HOST  ", style=f"bold {COLOR_SUBTITLE}")
+        host_line.append(
+            model["host_name"] or "Waiting for the host",
+            style="bold white",
+        )
+        content.add_row(host_line)
+
+        if not compact:
+            share_hint = model["share_hint"]
+            if self.console.width < 36 and model["room_code"] != "—":
+                share_hint = "Share this code."
+            elif narrow and model["room_code"] != "—":
+                share_hint = "Share this code with friends."
+            content.add_row(Text(
+                share_hint,
+                style=f"dim {COLOR_SECONDARY_TEXT}",
+                justify="center",
+            ))
+            content.add_row(Text(""))
+
+        if model["selection_title"]:
+            bar = Text()
+            bar.append("▎ ", style=f"bold {COLOR_ACCENT}")
+            bar.append("NOW WATCHING", style=f"bold {COLOR_SUBTITLE}")
+            content.add_row(bar)
+            content.add_row(Text(
+                self._truncate(model["selection_title"], max(10, inner_width)),
+                style="bold white",
+            ))
+            detail = ""
+            if model["selection_episode"]:
+                detail = f"Episode {model['selection_episode']}"
+            if model["selection_episode_title"]:
+                suffix = self._truncate(
+                    model["selection_episode_title"], max(8, inner_width - len(detail) - 3)
+                )
+                detail = f"{detail} — {suffix}" if detail else suffix
+            if detail:
+                content.add_row(Text(detail, style=f"bold {COLOR_TITLE}"))
+            if not model["is_host"] and not compact:
+                content.add_row(Text(
+                    "Chosen by the host.",
+                    style=f"dim {COLOR_SECONDARY_TEXT}",
+                ))
+            if not compact and self.console.height >= 32:
+                content.add_row(Text(""))
+        elif not model["is_host"] and not compact:
+            content.add_row(Text(
+                "The host hasn't picked an episode yet.",
+                style=f"dim {COLOR_SECONDARY_TEXT}",
+            ))
+            content.add_row(Text(""))
+
+        content.add_row(self._divider(inner_width))
+
+        if show_diagnostics:
+            content.add_row(self._diagnostics_view(model, inner_width))
+        else:
+            content.add_row(
+                self._members_view(model, inner_width, compact=compact)
+            )
+
+        content.add_row(self._divider(inner_width))
+
+        if model["error"]:
+            content.add_row(Text(
+                f"! {model['error']}",
+                style=f"bold {COLOR_ERROR}",
+            ))
+            content.add_row(Text(""))
+        if model["notice"]:
+            content.add_row(Text(
+                f"› {model['notice']}",
+                style=f"bold {COLOR_TITLE}",
+            ))
+            if self.console.height >= 32:
+                content.add_row(Text(""))
+
+        content.add_row(self._actions_text(model, inner_width, show_diagnostics))
+
+        border = COLOR_ERROR if model["error"] else COLOR_BORDER
+        title = "HOSTING ROOM" if model["is_host"] else "JOINED ROOM"
+        title_color = border if model["error"] else COLOR_TITLE
+        return Panel(
+            content,
+            title=f"[bold {title_color}]{title}[/bold {title_color}]",
+            box=HEAVY,
+            border_style=border,
+            padding=(0, 2) if self.console.height < 32 else (1, 2),
+            width=box_width,
+        )
+
+    def _members_view(
+        self, model: Dict[str, Any], width: int, compact: bool = False
+    ) -> Table:
+        table = Table.grid(expand=True)
+        table.add_column(justify="left", ratio=1)
+        table.add_column(justify="right")
+
+        header = Text("IN THE ROOM", style=f"bold {COLOR_SUBTITLE}")
+        count = Text(
+            str(model["participant_count"]),
+            style=f"bold {COLOR_TITLE}",
+        )
+        table.add_row(header, count)
+
+        rows = model["participant_rows"]
+        if not rows:
+            table.add_row(Text(
+                "Loading members...",
+                style=f"dim {COLOR_SECONDARY_TEXT}",
+            ), Text(""))
+            return table
+
+        for row in rows:
+            line = Text()
+            if row["role"] == "host":
+                line.append("● ", style=f"bold {COLOR_SUCCESS}")
+            else:
+                line.append("○ ", style=f"bold {COLOR_PROMPT}")
+            line.append(
+                self._truncate(row["name"], max(8, width - 26)),
+                style="bold white" if row["is_you"] else "white",
+            )
+            if row["is_you"] and row["name"].strip().lower() != "you":
+                line.append("  You", style=f"bold {COLOR_TITLE}")
+            if row["role"] == "host":
+                line.append("  [Host]", style=f"bold {COLOR_SUCCESS}")
+            else:
+                line.append("  [Guest]", style=f"bold {COLOR_PROMPT}")
+            table.add_row(line, Text(""))
+
+        if (
+            model["participant_count"] == 1
+            and not compact
+            and (not model["selection_title"] or self.console.height >= 32)
+        ):
+            hint = (
+                "Invite friends with the code."
+                if width < 40
+                else "You're the only one here. Share the code to invite friends."
+            )
+            table.add_row(Text(hint, style=f"dim {COLOR_SECONDARY_TEXT}"), Text(""))
+        return table
+
+    def _diagnostics_view(self, model: Dict[str, Any], width: int) -> Table:
+        diagnostics = model["diagnostics"]
+        table = Table.grid(expand=True)
+        table.add_column(width=18, justify="left")
+        table.add_column(justify="left")
+
+        table.add_row(
+            Text("CONNECTION DETAILS", style=f"bold {COLOR_SUBTITLE}"),
+            Text(""),
+        )
+
+        channels = diagnostics.get("channels") or {}
+        channel_text = (
+            ", ".join(
+                f"{name} {'joined' if joined else 'not joined'}"
+                for name, joined in channels.items()
+            )
+            if channels else "—"
+        )
+        states = diagnostics.get("channel_states") or {}
+        states_text = (
+            ", ".join(f"{name} {state}" for name, state in states.items())
+            if states else "—"
+        )
+        raw_error = (
+            diagnostics.get("channel_error")
+            or diagnostics.get("state_error")
+            or diagnostics.get("technical_error")
+            or "—"
+        )
+        error = sanitize_diagnostic(raw_error) if raw_error != "—" else "—"
+
+        rows = [
+            ("Transport", str(diagnostics.get("transport") or "—")),
+            ("Room ID", str(diagnostics.get("room_id") or "—")),
+            ("Channels", channel_text),
+            ("Channel states", states_text),
+            ("Room state", "loaded" if diagnostics.get("room_state_loaded") else "not loaded"),
+            ("Last error", error),
+        ]
+        for label, value in rows:
+            table.add_row(
+                Text(label, style=f"dim {COLOR_SECONDARY_TEXT}"),
+                Text(self._truncate(value, max(8, width - 20)), style="white"),
+            )
+        return table
+
+    def _actions_text(
+        self, model: Dict[str, Any], width: int, show_diagnostics: bool
+    ) -> Text:
+        entries: List[Tuple[str, str, str]] = []
+        if model["is_host"]:
+            entries.append(("b", "Browse Anime", COLOR_ACCENT))
+        entries.append(("l", "Leave Room", COLOR_ERROR))
+        entries.append((
+            "i",
+            "Hide Details" if show_diagnostics else "Details",
+            COLOR_SUBTITLE,
+        ))
+        entries.append(("q", "Quit", COLOR_TITLE))
+
+        if width < 30:
+            short = {
+                "Browse Anime": "Browse",
+                "Leave Room": "Leave",
+                "Hide Details": "Hide",
+            }
+            entries = [
+                (key, short.get(label, label), color)
+                for key, label, color in entries
+            ]
+
+        separator = " • "
+        rows: List[List[Tuple[str, str, str]]] = []
+        current: List[Tuple[str, str, str]] = []
+        current_len = 0
+        for entry in entries:
+            segment_len = cell_len(f"[{entry[0]}] {entry[1]}")
+            next_len = current_len + (
+                cell_len(separator) if current else 0
+            ) + segment_len
+            if current and next_len > width:
+                rows.append(current)
+                current = []
+                current_len = 0
+                next_len = segment_len
+            current.append(entry)
+            current_len = next_len
+        if current:
+            rows.append(current)
+
+        combined = Text()
+        for row_idx, chunk in enumerate(rows):
+            if row_idx:
+                combined.append("\n")
+            combined.append_text(self._keycap_row(chunk, separator=separator))
+        return combined
+
+    def _keycap_row(
+        self,
+        entries: Sequence[Tuple[str, str, str]],
+        separator: str = "    ",
+    ) -> Text:
+        row = Text()
+        for idx, (key, label, color) in enumerate(entries):
+            if idx:
+                row.append(separator, style=f"bold {COLOR_BORDER}")
+            row.append("[", style=f"bold {COLOR_BORDER}")
+            row.append(key, style=f"bold {color}")
+            row.append("]", style=f"bold {COLOR_BORDER}")
+            row.append(f" {label}", style="white")
+        return row
+
+    @staticmethod
+    def _divider(width: int) -> Text:
+        return Text("─" * max(10, width), style=f"dim {COLOR_BORDER}")
+
+    # ------------------------------------------------------------------
+    # Shared anime selection
+    # ------------------------------------------------------------------
+    _PLAYBACK_SCALAR_KEYS = (
+        "title",
+        "episode_number",
+        "episode_title",
+        "start_time",
+        "audio_lang",
+        "subtitle_url",
+        "subtitle_lang",
+        "audio_url",
+        "subtitles_disabled",
+        "hls_bitrate",
+        "quality",
+        "provider_id",
+        "anime_id",
+    )
+
+    @classmethod
+    def _clean_playback(cls, playback: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(playback, dict):
+            return None
+        url = str(playback.get("url") or playback.get("stream_url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return None
+        clean: Dict[str, Any] = {"url": url}
+        for key in cls._PLAYBACK_SCALAR_KEYS:
+            value = playback.get(key)
+            if value is None or value == "":
+                continue
+            clean[key] = value
+        headers = playback.get("headers")
+        if isinstance(headers, dict):
+            clean["headers"] = {
+                str(name): str(value)
+                for name, value in headers.items()
+                if str(name).strip() and str(value).strip()
+            }
+        return clean
+
+    @classmethod
+    def _playback_from_selection(cls, selection: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(selection, dict):
+            return None
+        playback = selection.get("playback")
+        if not isinstance(playback, dict):
+            playback = selection.get("stream")
+        if isinstance(playback, dict):
+            return cls._clean_playback(playback)
+        if selection.get("stream_url"):
+            return cls._clean_playback(selection)
+        return None
+
+    @classmethod
+    def _playback_from_message(cls, message: Any) -> Optional[Dict[str, Any]]:
+        payload = (
+            message.get("payload")
+            if isinstance(message, dict)
+            else getattr(message, "payload", None)
+        )
+        if not isinstance(payload, dict):
+            return None
+        playback = payload.get("playback")
+        if not isinstance(playback, dict):
+            playback = payload.get("stream")
+        if isinstance(playback, dict):
+            return cls._clean_playback(playback)
+        if payload.get("stream_url"):
+            return cls._clean_playback(payload)
+        return None
+
+    @staticmethod
+    def _broadcast_playback(playback: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(playback, dict):
+            return None
+        clean = dict(playback)
+        headers = clean.get("headers")
+        if isinstance(headers, dict):
+            safe_headers = {
+                str(name): str(value)
+                for name, value in headers.items()
+                if str(name).strip().lower()
+                in {
+                    "referer",
+                    "origin",
+                    "user-agent",
+                    "accept",
+                    "accept-language",
+                    "range",
+                }
+            }
+            if safe_headers:
+                clean["headers"] = safe_headers
+            else:
+                clean.pop("headers", None)
+        return clean
+
+    @staticmethod
+    def _playback_error_notice(exc: BaseException) -> str:
+        raw = sanitize_diagnostic(str(exc))
+        lowered = raw.lower()
+        if isinstance(exc, FileNotFoundError) or "mpv not found" in lowered or (
+            "no video players" in lowered
+        ):
+            return "MPV isn't installed. Install mpv to watch together."
+        if "timed out waiting for mpv" in lowered:
+            return "MPV didn't respond. Close it and try another episode."
+        if "not connected" in lowered or "not_connected" in lowered:
+            return "Playback is local for now. Sync resumes when the room reconnects."
+        if "no playable stream" in lowered or "no stream" in lowered:
+            return "That episode has no playable stream. Try another one."
+        return f"Couldn't start playback: {raw[:120]}" if raw else (
+            "Couldn't start playback."
+        )
+
+    _REFERENCE_KEYS = (
+        "title",
+        "provider_id",
+        "anime_id",
+        "episode_number",
+        "episode_title",
+        "language_mode",
+        "poster",
+        "anime_type",
+    )
+
+    @classmethod
+    def _clean_reference(cls, reference: Any) -> Optional[Dict[str, str]]:
+        if not isinstance(reference, dict):
+            return None
+        clean: Dict[str, str] = {}
+        for key in cls._REFERENCE_KEYS:
+            value = reference.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                clean[key] = text[:300]
+        return clean or None
+
+    @classmethod
+    def _selection_reference(cls, selection: Any) -> Optional[Dict[str, str]]:
+        if not isinstance(selection, dict):
+            return None
+        embedded = selection.get("anime_reference")
+        if isinstance(embedded, dict):
+            return cls._clean_reference(embedded)
+
+        anime = selection.get("anime")
+        episode = selection.get("episode")
+
+        def pick(container: Any, *names: str) -> str:
+            for name in names:
+                value = (
+                    container.get(name)
+                    if isinstance(container, dict)
+                    else getattr(container, name, None)
+                )
+                if value not in (None, ""):
+                    return str(value)
+            return ""
+
+        reference = {
+            "title": selection.get("title") or pick(anime, "title_en", "title", "title_ar"),
+            "provider_id": selection.get("provider_id") or "",
+            "anime_id": selection.get("anime_id") or pick(anime, "id", "anime_id"),
+            "episode_number": selection.get("episode_number")
+            or pick(episode, "display_num", "number"),
+            "episode_title": selection.get("episode_title") or pick(episode, "title"),
+            "language_mode": selection.get("language_mode") or "",
+            "poster": selection.get("poster") or pick(anime, "thumbnail"),
+            "anime_type": selection.get("anime_type") or pick(anime, "type"),
+        }
+        return cls._clean_reference(reference)
+
+    @classmethod
+    def _reference_from_message(cls, message: Any) -> Optional[Dict[str, str]]:
+        payload = (
+            message.get("payload")
+            if isinstance(message, dict)
+            else getattr(message, "payload", None)
+        )
+        if not isinstance(payload, dict):
+            return None
+        reference = payload.get("anime_reference")
+        if not isinstance(reference, dict):
+            room = payload.get("room")
+            if isinstance(room, dict):
+                reference = room.get("anime_reference")
+        if not isinstance(reference, dict):
+            reference = payload
+        return cls._clean_reference(reference)
+
+    @staticmethod
+    def _selection_label(reference: Dict[str, Any]) -> str:
+        title = str(reference.get("title") or "the host's pick")
+        episode = str(reference.get("episode_number") or "").strip()
+        return f"{title} — Episode {episode}" if episode else title
+
+    # ------------------------------------------------------------------
+    # Friendly errors and clipboard
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_code_error(exc: BaseException) -> bool:
+        # Only these two are worth re-entering a code for.
+        return getattr(exc, "code", "") in {
+            "invalid_room_code",
+            "room_not_found",
+        }
+
+    @staticmethod
+    def _can_retry(exc: BaseException) -> bool:
+        return getattr(exc, "code", "") not in {
+            "room_full",
+            "room_expired",
+            "too_many_rooms",
+            "invalid_nickname",
+        }
+
+    def _friendly_error(
+        self, exc: BaseException, context: str
+    ) -> Tuple[str, str, str]:
+        code = str(getattr(exc, "code", "") or "")
+        raw = str(getattr(exc, "description", "") or exc or type(exc).__name__)
+        technical = f"{code}: {raw}" if code else raw
+        lowered = raw.lower()
+
+        if code == "invalid_supabase_config" or "invalid api key" in lowered or (
+            "publishable key" in lowered and "invalid" in lowered
+        ):
+            return (
+                "Watch Together needs setup",
+                "The Supabase publishable key is missing or invalid. Run "
+                "`python main.py --setup-supabase` and paste the project's "
+                "publishable (anon) key.",
+                technical,
+            )
+        if code == "invalid_room_code":
+            return (
+                "That code didn't work",
+                "Room codes are six digits. Check the code with the host and try again.",
+                technical,
+            )
+        if code == "room_not_found":
+            return (
+                "We couldn't find that room",
+                "Check the code with the host. Rooms close after a while.",
+                technical,
+            )
+        if code == "room_full":
+            return (
+                "This room is full",
+                "Ask the host to make space, or try another room.",
+                technical,
+            )
+        if code == "room_expired":
+            return (
+                "This room has ended",
+                "Ask the host to open a new room.",
+                technical,
+            )
+        if code == "too_many_rooms":
+            return (
+                "You already have rooms open",
+                "Wait for an old room to expire, then try again.",
+                technical,
+            )
+        if code in {
+            "room_code_secret_missing",
+            "room_code_generation_failed",
+            "server_misconfigured",
+        }:
+            return (
+                "Watch Together isn't ready",
+                "The service is being set up. Please try again later.",
+                technical,
+            )
+        if code == "invalid_nickname":
+            return (
+                "That name won't work",
+                "Try a shorter name.",
+                technical,
+            )
+        if code in {
+            "channel_subscribe_failed",
+            "realtime_error",
+            "not_joined",
+        }:
+            return (
+                "Live updates aren't connected",
+                "The room is open, but live updates aren't connected. Try again, or leave the room.",
+                technical,
+            )
+        if code == "leave_failed":
+            return (
+                "We couldn't leave the room",
+                "Check your connection and try again.",
+                technical,
+            )
+        if code in {
+            "not_authenticated",
+            "missing_authorization",
+            "invalid_token",
+            "unauthorized",
+            "401",
+            "403",
+        } or "jwt" in lowered or "unauthorized" in lowered:
+            return (
+                "We couldn't sign you in",
+                "Check your internet connection and try again.",
+                technical,
+            )
+        if code in {"connection_failed", "network_error", "timeout"} or any(
+            token in lowered
+            for token in ("timed out", "timeout", "connection", "network", "unreachable")
+        ):
+            return (
+                "We couldn't connect",
+                "Check your internet connection and try again.",
+                technical,
+            )
+
+        if context == "leave":
+            return (
+                "We couldn't leave the room",
+                "Check your connection and try again.",
+                technical,
+            )
+        if context == "join":
+            return (
+                "We couldn't join the room",
+                "Check the code and your connection, then try again.",
+                technical,
+            )
+        if context == "room":
+            return (
+                "Live updates aren't connected",
+                "Try again, or leave the room and rejoin.",
+                technical,
+            )
+        return (
+            "We couldn't open the room",
+            "Check your internet connection and try again.",
+            technical,
+        )
+
+    @staticmethod
+    def _copy_to_clipboard(text: str) -> bool:
+        if not text or not sys.stdout.isatty():
+            return False
+        try:
+            payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            sys.stdout.write(f"\033]52;c;{payload}\a")
+            sys.stdout.flush()
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
+    def clear(self) -> None:
+        self.console.clear()
+        try:
+            self.console.show_cursor(False)
+        except Exception:
+            pass
+
+    def _pause(self, message: str = "Press any key to continue...") -> None:
+        try:
+            self.console.print(f"[dim]{message}[/dim]", justify="center")
+            with RawTerminal():
+                while get_key() is None:
+                    time.sleep(0.02)
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    @staticmethod
+    def _describe_error(exc: BaseException) -> str:
+        if isinstance(exc, PartyClientError):
+            return f"{exc.code}: {exc.description}"
+        return str(exc) or exc.__class__.__name__
+
+    # ------------------------------------------------------------------
+    # Legacy screens kept for embedders; the redesigned flow does not use them.
+    # ------------------------------------------------------------------
+    def lobby_screen(self, room_data: Dict[str, Any]) -> Dict[str, Any]:
+        room_code = room_data.get("room_code", "UNKNOWN")
+        host_nickname = room_data.get("host_nickname", "Host")
+        participants = room_data.get("participants", [])
+        ready_count = room_data.get("ready_count", 0)
+        total_count = room_data.get("total_count", 0)
+
+        body = Text()
+        body.append(f"Room  {room_code}\n", style=f"bold {COLOR_TITLE}")
+        body.append(f"Host  {host_nickname}\n\n", style="white")
+        body.append(f"Participants  {ready_count}/{total_count} ready\n", style="white")
+        body.append(str(participants), style=f"dim {COLOR_SECONDARY_TEXT}")
+
+        self.clear()
+        self.console.print(self._stack(
+            self._header("Watch Together", "Room lobby"),
+            None,
+            Panel(
+                body,
+                title=f"[bold {COLOR_TITLE}]Lobby[/bold {COLOR_TITLE}]",
+                box=HEAVY,
+                border_style=COLOR_BORDER,
+                padding=(1, 2),
+                width=self._panel_width(60),
+            ),
+        ))
+        self._pause("Press any key to continue...")
+
+        return {
+            "action": "lobby",
+            "room_code": room_code,
+            "host_nickname": host_nickname,
+            "participants": participants,
+            "ready_count": ready_count,
+            "total_count": total_count,
+        }
+
+    async def watch_party_screen(self, room_data: Dict[str, Any]) -> Dict[str, Any]:
+        room_code = room_data.get("room_code", "UNKNOWN")
+        anime_title = room_data.get("anime_title", "No anime selected")
+        episode_info = room_data.get("episode_info", "No episode selected")
+        playback_position = room_data.get("position", 0)
+        duration = room_data.get("duration", 0)
+        is_paused = room_data.get("paused", False)
+
+        body = Text()
+        body.append(f"{anime_title}\n", style="bold white")
+        body.append(f"{episode_info}\n\n", style=f"dim {COLOR_SECONDARY_TEXT}")
+        body.append(
+            f"{playback_position:.1f}s / {duration:.1f}s  •  "
+            f"{'Paused' if is_paused else 'Playing'}\n\n",
+            style="white",
+        )
+        body.append(f"Room  {room_code}", style=f"bold {COLOR_TITLE}")
+
+        self.clear()
+        self.console.print(self._stack(
+            self._header("Watch Together", "Watching together"),
+            None,
+            Panel(
+                body,
+                title=f"[bold {COLOR_TITLE}]Now playing[/bold {COLOR_TITLE}]",
+                box=HEAVY,
+                border_style=COLOR_BORDER,
+                padding=(1, 2),
+                width=self._panel_width(64),
+            ),
+        ))
+        self._pause("Press any key to continue...")
+
+        return {
+            "action": "watch_party",
+            "room_code": room_code,
+            "anime_title": anime_title,
+            "episode_info": episode_info,
+            "position": playback_position,
+            "duration": duration,
+            "paused": is_paused,
+        }
+
+    def display_message(self, title: str, message: str, style: str = "info") -> None:
+        border = COLOR_ERROR if style == "error" else COLOR_BORDER
+        body = Text(message, style="white", justify="center")
+        self.clear()
+        self.console.print(self._stack(
+            self._header("Watch Together"),
+            None,
+            Panel(
+                body,
+                title=f"[bold {border}]{title}[/bold {border}]",
+                box=HEAVY,
+                border_style=border,
+                padding=(1, 2),
+                width=self._panel_width(60),
+            ),
+        ))
+        self._pause("Press any key to continue...")

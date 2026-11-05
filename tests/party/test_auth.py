@@ -14,8 +14,9 @@ def test_room_code_generation():
         code = manager._generate_room_code()
         assert isinstance(code, str)
         assert len(code) == 5
-        assert code.isupper()
-        # Unique within this test
+        # Digits-only codes are valid; just keep them out of the alphabet.
+        assert set(code) <= set(manager._alphabet)
+        assert code.upper() == code
         codes.add(code)
     # Should have multiple unique codes
     assert len(codes) > 1

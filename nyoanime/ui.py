@@ -487,6 +487,42 @@ class UIManager:
         
         return result_container.get('result')
 
+    def _home_navigation_model(self, active_provider_items):
+        app_nav = [
+            {"key": "w", "label": "watch together", "action": "watchtogether"},
+            {"key": "l", "label": "history", "action": "history"},
+            {"key": "d", "label": "downloads", "action": "downloads"},
+            {"key": "f", "label": "favorites", "action": "favorites"},
+            {"key": "c", "label": "settings", "action": "settings"},
+        ]
+        exit_item = {"key": "q", "label": "quit", "action": "quit"}
+        app_items = app_nav + [exit_item]
+
+        shortcut_items = [
+            {"key": "search", "label": "Search", "action": "search"},
+        ] + active_provider_items + app_items + [
+            {"key": "n", "label": "Changelog", "action": "changelog"},
+        ]
+
+        # The exit tile always occupies the last slot. Items are padded before
+        # it so adding a feature never silently drops another menu entry.
+        grid_items = active_provider_items + app_nav
+        return {
+            "app_nav": app_nav,
+            "exit_item": exit_item,
+            "app_items": app_items,
+            "shortcut_items": shortcut_items,
+            "grid_items": grid_items,
+        }
+
+    @staticmethod
+    def _home_grid_rows(grid_items, exit_item, cols):
+        """Pad before the exit tile so it is always the final grid cell."""
+        rows_needed = (len(grid_items) + 1 + cols - 1) // cols
+        padding = rows_needed * cols - (len(grid_items) + 1)
+        flat = grid_items + [None] * padding + [exit_item]
+        return [flat[i:i + cols] for i in range(0, len(flat), cols)]
+
     def home_screen_menu(self, rpc_status=None, version_info=None, active_provider=None, provider=None):
         """Retro-pixel landing screen that scales with the terminal."""
         query = ""
@@ -530,31 +566,10 @@ class UIManager:
             if supports_feature(it["feature"])
         ]
 
-        app_nav = [
-            {"key": "l", "label": "history", "action": "history"},
-            {"key": "d", "label": "downloads", "action": "downloads"},
-            {"key": "f", "label": "favorites", "action": "favorites"},
-            {"key": "c", "label": "settings", "action": "settings"},
-        ]
-        exit_item = {"key": "q", "label": "quit", "action": "quit"}
-        app_items = app_nav + [exit_item]
-
-        shortcut_items = [
-            {"key": "search", "label": "Search", "action": "search"},
-        ] + active_provider_items + app_items + [
-            {"key": "n", "label": "Changelog", "action": "changelog"},
-        ]
-
-        # Linear slot order; the exit always occupies the twelfth (last) slot.
-        grid_items = (active_provider_items + app_nav)[:11]
-        grid_flat = []
-        for idx in range(12):
-            if idx == 11:
-                grid_flat.append(exit_item)
-            elif idx < len(grid_items):
-                grid_flat.append(grid_items[idx])
-            else:
-                grid_flat.append(None)
+        nav = self._home_navigation_model(active_provider_items)
+        exit_item = nav["exit_item"]
+        shortcut_items = nav["shortcut_items"]
+        grid_items = nav["grid_items"]
 
         grid_geometry = {
             "top": 0,
@@ -692,7 +707,7 @@ class UIManager:
 
             box_width = m["box_width"]
             avail = box_width - 6
-            full_placeholder = "Search anime title or paste a URL (e, m, t, p, r, g, s, l, f)..."
+            full_placeholder = "Search anime title or paste a URL (e, m, t, p, r, g, w, l, f)..."
             if avail >= cell_len(full_placeholder) + 4:
                 placeholder = full_placeholder
             else:
@@ -719,9 +734,9 @@ class UIManager:
             add(Align.center(search_panel), 3)
 
             if screen_h >= 14:
-                hint = "Use keys (e, m, t, r, g, s, l, f) or type keywords..."
+                hint = "Type a key then Enter (e, m, t, w, l, f) or click a tile..."
                 if screen_w < 66:
-                    hint = "Use keys or type keywords..."
+                    hint = "Type a key + Enter, or click a tile..."
                 if screen_w >= cell_len(hint):
                     add(Text(hint, style=palette["text_dim"]), 1)
             add_gap(m["vgap"])
@@ -729,7 +744,7 @@ class UIManager:
             grid_top_rows = content_h
 
             cols = m["grid_cols"]
-            grid_rows = [grid_flat[i:i + cols] for i in range(0, len(grid_flat), cols)]
+            grid_rows = self._home_grid_rows(grid_items, exit_item, cols)
 
             def cell_plain(item):
                 if item is None:
