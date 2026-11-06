@@ -502,6 +502,16 @@ class WatchTogetherUI:
         return WTRClient(self._get_relay_url(), nickname=nickname)
 
     def _get_relay_url(self) -> str:
+        # Prefer Supabase Realtime WebSocket if configured, otherwise fallback to a public relay
+        from .party.supabase_config import use_supabase_transport
+        if use_supabase_transport():
+            # When using Supabase transport, we should be connected via the Supabase client
+            # This method is called for the WebSocket relay fallback, so we need to handle this
+            # appropriately. For now, return a placeholder that will be overridden when
+            # Supabase transport is used, but we need to ensure this doesn't cause issues.
+            # We return a placeholder that indicates Supabase transport should be used
+            return "wss://mxacanxpjkqeudlwzhwr.supabase.co/realtime/v1/ws"
+        # For backward compatibility, default to local WebSocket relay
         return "ws://localhost:8765"
 
     # ------------------------------------------------------------------
