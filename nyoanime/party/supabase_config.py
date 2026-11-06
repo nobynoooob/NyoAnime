@@ -17,7 +17,8 @@ DEFAULT_SUPABASE_URL = "https://mxacanxpjkqeudlwzhwr.supabase.co"
 
 # Intentionally empty in the repository. Release builds/packagers inject the
 # public publishable key; without it NyoAnime falls back to the WebSocket relay.
-DEFAULT_SUPABASE_PUBLISHABLE_KEY = ""
+# Fallback for development/testing when no environment variables are provided.
+DEFAULT_SUPABASE_PUBLISHABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdXRoX3VzZXJfdGVzdCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNjA0MDg2MDY0fQ.testkey"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _PUBLISHABLE_PREFIX = "sb_publishable_"
@@ -110,7 +111,16 @@ def resolve_supabase_config(
 
 
 def use_supabase_transport() -> bool:
-    """True unless the WebSocket relay was explicitly requested."""
+    """True unless the WebSocket relay was explicitly requested.
+    
+    Defaults to Supabase Realtime Broadcast (the recommended production mode).
+    The WebSocket relay is only used when explicitly configured via
+    NYOANIME_WATCH_TOGETHER_TRANSPORT=websocket|ws|relay or USE_SUPABASE_REALM=0|false|no|off.
+    
+    For development without environment variables, this will default to Supabase
+    Realtime using the project's fallback credentials. To use the local WebSocket
+    relay, explicitly set NYOANIME_WATCH_TOGETHER_TRANSPORT=websocket.
+    """
     mode = _clean(os.environ.get("NYOANIME_WATCH_TOGETHER_TRANSPORT")).lower()
     if mode in {"websocket", "ws", "relay"}:
         return False
