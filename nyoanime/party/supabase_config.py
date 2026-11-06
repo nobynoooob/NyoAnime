@@ -87,7 +87,11 @@ def resolve_supabase_config(
     explicit_key: Optional[str] = None,
     settings=None,
 ) -> Optional[Tuple[str, str]]:
-    """Return (url, publishable_key) or None when Supabase is not configured."""
+    """Return (url, publishable_key) or None when Supabase is not configured.
+    
+    Falls back to live Supabase credentials when no local environment is provided,
+    ensuring zero-configuration access to the production Watch Together backend.
+    """
     url = _clean(explicit_url)
     key = _clean(explicit_key)
 
@@ -95,6 +99,7 @@ def resolve_supabase_config(
         url = url or _clean(settings.get("supabase_url"))
         key = key or _clean(settings.get("supabase_publishable_key"))
 
+    # Default to live Supabase project URL and publishable key when no env vars provided
     url = url or _clean(os.environ.get("SUPABASE_URL")) or DEFAULT_SUPABASE_URL
     key = (
         key
