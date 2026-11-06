@@ -18,7 +18,7 @@ DEFAULT_SUPABASE_URL = "https://mxacanxpjkqeudlwzhwr.supabase.co"
 # Intentionally empty in the repository. Release builds/packagers inject the
 # public publishable key; without it NyoAnime falls back to the WebSocket relay.
 # Fallback for development/testing when no environment variables are provided.
-DEFAULT_SUPABASE_PUBLISHABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdXRoX3VzZXJfdGVzdCIsImV4cCI6OTk5OTk5OTk5OSwiaWF0IjoxNjA0MDg2MDY0fQ.testkey"
+DEFAULT_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_3vCJNzwcIhmLI2QE75nNuA_uy5EG_Uh"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _PUBLISHABLE_PREFIX = "sb_publishable_"
