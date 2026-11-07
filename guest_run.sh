@@ -36,4 +36,11 @@ if [ -z "$ROOM_CODE" ]; then
     exit 1
 fi
 
-exec python3 main.py --join-room "$ROOM_CODE" "$@"
+# A separate profile keeps the guest signed in as its own participant even
+# when the host runs on the same machine.
+export NYOANIME_WATCH_TOGETHER_NAME=Guest
+
+exec python main.py \
+    --session-dir "$HOME/.nyoanime/guest" \
+    --join-room "$ROOM_CODE" \
+    "$@"
