@@ -1,10 +1,12 @@
 """
 Language-mode resolution for NyoAnime.
 
-Three user-facing modes are supported:
-    ar_sub  -> Arabic providers (existing workflow)
-    en_sub  -> HiAnime subbed source
-    en_dub  -> HiAnime dubbed source
+Five user-facing modes are supported:
+    ar_sub   -> Arabic subtitled providers (existing workflow)
+    ar_dub   -> Arabic dubbed anime (Stardima Anime Dub)
+    en_sub   -> HiAnime subbed source
+    en_dub   -> HiAnime dubbed source
+    cartoon  -> Arabic dubbed cartoons / kids (Stardima Kids)
 
 The mode is authoritative.  A provider can only be selected when its
 ``language_mode`` matches, which prevents accidentally playing an Arabic
@@ -23,6 +25,13 @@ LANGUAGE_MODES: Dict[str, Dict[str, str]] = {
         "audio_mode": "sub",
         "default_provider": "anime3rb",
     },
+    "ar_dub": {
+        "label": "Arabic Dub",
+        "badge": "AR DUB",
+        "language": "ar",
+        "audio_mode": "dub",
+        "default_provider": "stardima",
+    },
     "en_sub": {
         "label": "English Sub",
         "badge": "EN SUB",
@@ -37,6 +46,13 @@ LANGUAGE_MODES: Dict[str, Dict[str, str]] = {
         "audio_mode": "dub",
         "default_provider": "hianime_dub",
     },
+    "cartoon": {
+        "label": "Cartoon",
+        "badge": "CARTOON",
+        "language": "ar",
+        "audio_mode": "dub",
+        "default_provider": "stardima_kids",
+    },
 }
 
 MODE_CHOICES: List[str] = list(LANGUAGE_MODES)
@@ -45,8 +61,14 @@ _ALIASES = {
     "ar": "ar_sub",
     "arabic": "ar_sub",
     "arabic_sub": "ar_sub",
+    "arabic_subtitled": "ar_sub",
     "ar-sub": "ar_sub",
     "sub_ar": "ar_sub",
+    "ar_dub": "ar_dub",
+    "arabic_dub": "ar_dub",
+    "arabic_dubbed": "ar_dub",
+    "ar-dub": "ar_dub",
+    "dub_ar": "ar_dub",
     "en": "en_sub",
     "english": "en_sub",
     "english_sub": "en_sub",
@@ -58,6 +80,12 @@ _ALIASES = {
     "en-dub": "en_dub",
     "dub": "en_dub",
     "dub_en": "en_dub",
+    "cartoon": "cartoon",
+    "cartoons": "cartoon",
+    "kids": "cartoon",
+    "kid": "cartoon",
+    "stardima_kids": "cartoon",
+    "stardima_cartoon": "cartoon",
 }
 
 

@@ -54,12 +54,25 @@ class SettingsManager:
                 merged["language_mode"] = "en_dub"
             elif provider_id.startswith("hianime"):
                 merged["language_mode"] = "en_sub"
+            elif provider_id.startswith("stardima_kids") or provider_id.startswith("stardima_cartoon"):
+                merged["language_mode"] = "cartoon"
+            elif provider_id.startswith("stardima"):
+                merged["language_mode"] = "ar_dub"
             else:
                 merged["language_mode"] = "ar_sub"
             merged["auto_provider"] = False
 
-        if merged.get("language_mode") not in ("ar_sub", "en_sub", "en_dub"):
+        if merged.get("language_mode") not in ("ar_sub", "ar_dub", "en_sub", "en_dub", "cartoon"):
             merged["language_mode"] = "ar_sub"
+
+        # Stardima providers moved out of ar_sub when Arabic Dub and Cartoon
+        # became distinct modes. Keep existing stardima users on their provider.
+        provider_id = str(merged.get("anime_provider") or "").lower()
+        if provider_id.startswith("stardima") and merged.get("language_mode") == "ar_sub":
+            if "kids" in provider_id or "cartoon" in provider_id:
+                merged["language_mode"] = "cartoon"
+            else:
+                merged["language_mode"] = "ar_dub"
         if not isinstance(merged.get("auto_provider"), bool):
             merged["auto_provider"] = True
         return merged

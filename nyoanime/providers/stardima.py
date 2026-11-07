@@ -99,7 +99,7 @@ class StardimaProvider(BaseAnimeProvider):
     description: str = "Arabic dubbed anime with direct backup streams"
     language = "ar"
     audio_mode = "dub"
-    language_mode = "ar_sub"
+    language_mode = "ar_dub"
 
     content_scope: str = "anime"
 
@@ -828,6 +828,6 @@ class StardimaKidsProvider(StardimaProvider):
     description: str = "Arabic dubbed cartoons for kids with direct backup streams"
     language = "ar"
     audio_mode = "dub"
-    language_mode = "ar_sub"
+    language_mode = "cartoon"
 
     content_scope: str = "cartoon"

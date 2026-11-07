@@ -14,6 +14,7 @@ from nyoanime.models import Episode, QualityOption
 from nyoanime.providers.hianime import HiAnimeDubProvider, HiAnimeProvider
 from nyoanime.providers.language import (
     language_mode_label,
+    mode_audio_lang,
     normalize_language_mode,
     providers_for_mode,
     resolve_provider_id,
@@ -298,10 +299,25 @@ class TestLanguageModes:
 
     def test_provider_sets_per_mode(self):
         assert "anime3rb" in providers_for_mode("ar_sub")
+        assert "stardima" not in providers_for_mode("ar_sub")
+        assert providers_for_mode("ar_dub") == ["stardima"]
         assert providers_for_mode("en_sub") == ["hianime"]
         assert providers_for_mode("en_dub") == ["hianime_dub"]
+        assert providers_for_mode("cartoon") == ["stardima_kids"]
         assert resolve_provider_id("en_dub", "anime3rb", auto=True) == "hianime_dub"
         assert resolve_provider_id("en_sub", "hianime_dub", auto=False) == "hianime"
+        assert resolve_provider_id("ar_dub", "anime3rb", auto=True) == "stardima"
+        assert resolve_provider_id("cartoon", "anime3rb", auto=True) == "stardima_kids"
+
+    def test_new_modes_and_labels(self):
+        assert normalize_language_mode("Arabic Dub") == "ar_dub"
+        assert normalize_language_mode("arabic_dub") == "ar_dub"
+        assert normalize_language_mode("Cartoon") == "cartoon"
+        assert normalize_language_mode("kids") == "cartoon"
+        assert language_mode_label("ar_dub") == "Arabic Dub"
+        assert language_mode_label("cartoon") == "Cartoon"
+        assert mode_audio_lang("ar_dub") == "ara,ar"
+        assert mode_audio_lang("cartoon") == "ara,ar"
 
     def test_manager_accepts_legacy_hianime_alias(self):
         assert ProviderManager.get_provider("hianime_sub").id == "hianime"
@@ -327,7 +343,70 @@ class TestLanguageModes:
         assert settings.get("language_mode") == "en_dub"
         assert settings.get("auto_provider") is False
 
+    @pytest.mark.parametrize(
+        "provider_id, expected_mode",
+        [
+            ("stardima", "ar_dub"),
+            ("stardima_anime", "ar_dub"),
+            ("stardima_kids", "cartoon"),
+            ("stardima_cartoon", "cartoon"),
+        ],
+    )
+    def test_stardima_provider_choice_migrates_to_matching_mode(
+        self, tmp_path, monkeypatch, provider_id, expected_mode
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        db = tmp_path / ".nyoanime" / "database"
+        db.mkdir(parents=True)
+        (db / "config.json").write_text(
+            json.dumps({"anime_provider": provider_id}), encoding="utf-8"
+        )
+
+        settings = SettingsManager()
+        assert settings.get("language_mode") == expected_mode
+        assert settings.get("auto_provider") is False
+
+    @pytest.mark.parametrize(
+        "provider_id, expected_mode",
+        [
+            ("stardima", "ar_dub"),
+            ("stardima_kids", "cartoon"),
+        ],
+    )
+    def test_existing_stardima_mode_is_reclassified(
+        self, tmp_path, monkeypatch, provider_id, expected_mode
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        db = tmp_path / ".nyoanime" / "database"
+        db.mkdir(parents=True)
+        (db / "config.json").write_text(
+            json.dumps(
+                {"anime_provider": provider_id, "language_mode": "ar_sub"}
+            ),
+            encoding="utf-8",
+        )
+
+        settings = SettingsManager()
+        assert settings.get("language_mode") == expected_mode
+
     def test_settings_menu_switches_language_and_provider(self, tmp_path, monkeypatch):
+        from nyoanime.ui import UIManager
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr("nyoanime.ui.time.sleep", lambda *_args: None)
+        settings = SettingsManager()
+        ui = UIManager()
+        keys = iter(["RIGHT", "RIGHT", "q"])
+
+        with mock.patch("nyoanime.ui.get_key", side_effect=lambda: next(keys)):
+            with mock.patch("nyoanime.ui.RawTerminal"):
+                ui.settings_menu(settings)
+
+        # ar_sub -> ar_dub -> en_sub
+        assert settings.get("language_mode") == "en_sub"
+        assert settings.get("anime_provider") == "hianime"
+
+    def test_settings_menu_maps_arabic_dub_and_cartoon(self, tmp_path, monkeypatch):
         from nyoanime.ui import UIManager
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -340,8 +419,8 @@ class TestLanguageModes:
             with mock.patch("nyoanime.ui.RawTerminal"):
                 ui.settings_menu(settings)
 
-        assert settings.get("language_mode") == "en_sub"
-        assert settings.get("anime_provider") == "hianime"
+        assert settings.get("language_mode") == "ar_dub"
+        assert settings.get("anime_provider") == "stardima"
 
     def test_switching_language_resolves_compatible_provider(self, tmp_path, monkeypatch):
         monkeypatch.setattr(Path, "home", lambda: tmp_path)

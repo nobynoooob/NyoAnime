@@ -1453,7 +1453,9 @@ class NyoAnimeApp:
     def _default_audio_index(audio_tracks, language_mode=''):
         if not audio_tracks:
             return None
-        wanted = {'en_sub': 'jpn', 'en_dub': 'eng', 'ar_sub': 'ara'}.get(language_mode, '')
+        wanted = (
+            mode_audio_lang(language_mode).split(",", 1)[0] if language_mode else ''
+        )
         if wanted:
             for idx, track in enumerate(audio_tracks):
                 lang = str(track.get('lang') or '').lower()
