@@ -154,7 +154,7 @@ class AnimeifyProvider(BaseAnimeProvider):
     def thumbnails_base(self) -> str:
         return self._ensure_creds().get('THUMBNAILS_BASE_URL', FALLBACK_THUMBNAILS_BASE)
 
-    def _post(self, endpoint: str, payload: Dict[str, Any], timeout: int = 10) -> Optional[requests.Response]:
+    def _post(self, endpoint: str, payload: Dict[str, Any], timeout: int = 5) -> Optional[requests.Response]:
         """Safe HTTP POST with graceful error handling and token injection."""
         try:
             full_url = f"{self.api_base.rstrip('/')}/{endpoint.lstrip('/')}"
@@ -329,7 +329,7 @@ class AnimeifyProvider(BaseAnimeProvider):
         """Extract direct video stream link from Mediafire URL or key."""
         try:
             url = mf_url if mf_url.startswith("http") else f"https://www.mediafire.com/file/{mf_url}"
-            resp = self.session.get(url, timeout=8)
+            resp = self.session.get(url, timeout=5)
             if resp.status_code == 200:
                 match = re.search(r'(https://download[^"\'\s>]+)', resp.text)
                 if match:

@@ -121,7 +121,7 @@ class HiAnimeProvider(BaseAnimeProvider):
             if self._curl_session is None:
                 self._curl_session = curl_requests.Session(impersonate="chrome")
                 self._curl_session.headers.update(self.session.headers)
-            return self._curl_session.get(url, headers=headers, timeout=20)
+            return self._curl_session.get(url, headers=headers, timeout=5)
         except Exception as exc:
             logger.debug("HIANIME", f"curl-cffi fallback failed: {exc}")
             return None
@@ -129,7 +129,7 @@ class HiAnimeProvider(BaseAnimeProvider):
     def _get(self, url: str, referer: str = "", params: Optional[dict] = None):
         headers = {"Referer": referer} if referer else {}
         try:
-            response = self.session.get(url, headers=headers, params=params, timeout=(6, 18))
+            response = self.session.get(url, headers=headers, params=params, timeout=(3, 5))
         except Exception as exc:
             logger.debug("HIANIME", f"Request failed: {url} ({exc})")
             response = None

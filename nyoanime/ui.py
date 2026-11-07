@@ -419,7 +419,7 @@ class UIManager:
         ):
             time.sleep(max(0.5, duration))
 
-    def run_with_loading(self, message: str, target_func, *args):
+    def run_with_loading(self, message: str, target_func, *args, status_getter=None, **kwargs):
         self.clear()
         
         result_container = {}
@@ -427,7 +427,7 @@ class UIManager:
 
         def worker():
             try:
-                result = target_func(*args)
+                result = target_func(*args, **kwargs)
                 result_container['result'] = result
             except Exception as e:
                 result_container['error'] = e
@@ -453,14 +453,30 @@ class UIManager:
             clean_msg = clean
 
         frame_idx = 0
+        started_at = time.monotonic()
+
+        def _status_line():
+            if status_getter is None:
+                return ""
+            try:
+                value = status_getter()
+            except Exception:
+                return ""
+            return str(value or "").strip()
 
         def generate_loading_renderable():
             frame = bouncing_frames[frame_idx % len(bouncing_frames)]
             color = accent_colors[frame_idx % len(accent_colors)]
+            elapsed = time.monotonic() - started_at
 
             msg_text = Text()
             msg_text.append(f"{frame} ", style=f"bold {color}")
             msg_text.append(clean_msg, style="bold white")
+            msg_text.append(f"  {elapsed:.1f}s", style=f"dim {sub_col}")
+
+            status_text = _status_line()
+            if status_text:
+                msg_text.append(f"\n{status_text}", style=f"dim {sub_col}")
 
             root = Table.grid(expand=False)
             root.add_column(justify="center")
@@ -471,11 +487,11 @@ class UIManager:
             return Align.center(root, vertical="middle", height=self.console.height)
 
         try:
-            with Live(generate_loading_renderable(), console=self.console, refresh_per_second=15, screen=True) as live:
+            with Live(generate_loading_renderable(), console=self.console, refresh_per_second=20, screen=True) as live:
                 while not thread_done.is_set():
                     frame_idx += 1
                     live.update(generate_loading_renderable())
-                    time.sleep(0.08)
+                    time.sleep(0.05)
         except KeyboardInterrupt:
             thread_done.set()
             raise

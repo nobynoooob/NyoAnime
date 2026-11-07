@@ -1,6 +1,7 @@
 import sys
 import atexit
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from rich.align import Align
 from rich.panel import Panel
@@ -10,6 +11,8 @@ from rich.box import HEAVY
 from .config import COLOR_BORDER, COLOR_TITLE, GOODBYE_ART, POPULAR_GENRES
 from .ui import UIManager
 from .providers import ProviderManager
+from .providers.language import providers_for_mode
+from .providers.search import search_providers
 from .player import PlayerManager
 from .discord_rpc import DiscordRPCManager
 from .models import AnimeResult, Episode, QualityOption
@@ -367,7 +370,7 @@ class NyoAnimeApp:
                 if not search_query:
                     continue
                 self.rpc.update_searching()
-                results = self.ui.run_with_loading("Searching...", self.api.search_anime, search_query)
+                results = self._search_all_providers(search_query)
                 if not results:
                     q_clean = re.sub(r'[:\-!?,._\(\)\[\]]', ' ', search_query).strip()
                     q_clean = re.sub(r'\s+', ' ', q_clean)
@@ -382,7 +385,7 @@ class NyoAnimeApp:
                         variants.append(' '.join(words[:3]))
 
                     for alt_q in variants:
-                        results = self.api.search_anime(alt_q)
+                        results = self._search_all_providers(alt_q)
                         if results:
                             break
 
@@ -436,20 +439,21 @@ class NyoAnimeApp:
 
             self.rpc.update_viewing_anime(selected_anime.title_en, selected_anime.thumbnail)
             
-            episodes = self.ui.run_with_loading(
-                "Loading episodes & poster...",
-                lambda a=selected_anime: self._fetch_episodes_and_poster(a)
-            )
-            
-            if not episodes:
-                self.ui.render_message(
-                    "✗ No Episodes", 
-                    f"No episodes found for '{selected_anime.title_en}'.", 
-                    "error"
+            with self._using_provider(self._api_for_anime(selected_anime)):
+                episodes = self.ui.run_with_loading(
+                    "Loading episodes & poster...",
+                    lambda a=selected_anime: self._fetch_episodes_and_poster(a)
                 )
-                continue
-            
-            self.handle_episode_selection(selected_anime, episodes)
+
+                if not episodes:
+                    self.ui.render_message(
+                        "✗ No Episodes",
+                        f"No episodes found for '{selected_anime.title_en}'.",
+                        "error"
+                    )
+                    continue
+
+                self.handle_episode_selection(selected_anime, episodes)
 
     def handle_latest_episodes(self):
         episodes = self.ui.run_with_loading(
@@ -1090,22 +1094,22 @@ class NyoAnimeApp:
             selected_anime = results[anime_idx]
 
             self.rpc.update_viewing_anime(selected_anime.title_en, selected_anime.thumbnail)
-            
-            
-            episodes = self.ui.run_with_loading(
-                "Loading episodes & poster...",
-                lambda a=selected_anime: self._fetch_episodes_and_poster(a)
-            )
-            
-            if not episodes:
-                self.ui.render_message(
-                    "✗ No Episodes", 
-                    f"No episodes found for '{selected_anime.title_en}'", 
-                    "error"
+
+            with self._using_provider(self._api_for_anime(selected_anime)):
+                episodes = self.ui.run_with_loading(
+                    "Loading episodes & poster...",
+                    lambda a=selected_anime: self._fetch_episodes_and_poster(a)
                 )
-                continue
-            
-            back_pressed = self.handle_episode_selection(selected_anime, episodes)
+
+                if not episodes:
+                    self.ui.render_message(
+                        "✗ No Episodes",
+                        f"No episodes found for '{selected_anime.title_en}'",
+                        "error"
+                    )
+                    continue
+
+                back_pressed = self.handle_episode_selection(selected_anime, episodes)
             if not back_pressed:
                 break
     
@@ -1278,6 +1282,54 @@ class NyoAnimeApp:
         if configured and provider_supports_mode(provider_id, configured):
             return normalize_language_mode(configured)
         return provider_language_mode(provider_id) if provider_id else normalize_language_mode(configured)
+
+    def _search_all_providers(self, query):
+        """Search every provider compatible with the current mode concurrently."""
+        mode = self._language_mode()
+        targets = providers_for_mode(mode)
+        progress = {"done": 0, "total": len(targets), "found": 0}
+
+        def on_done(provider_id, count):
+            progress["done"] += 1
+            progress["found"] += count
+
+        def status():
+            if progress["total"] <= 1:
+                return ""
+            return f"{progress['done']}/{progress['total']} sources · {progress['found']} results"
+
+        return self.ui.run_with_loading(
+            "Searching...",
+            search_providers,
+            query,
+            mode=mode,
+            timeout=5.0,
+            on_provider_done=on_done,
+            status_getter=status,
+        )
+
+    def _api_for_anime(self, anime):
+        """Return the provider that produced a concurrent-search result."""
+        provider_id = getattr(anime, "provider_id", "") or ""
+        if not provider_id:
+            return self.api
+        canonical = ProviderManager.get_canonical_id(provider_id)
+        if canonical == getattr(self.api, "id", ""):
+            return self.api
+        return ProviderManager.get_provider(canonical)
+
+    @contextmanager
+    def _using_provider(self, api):
+        """Temporarily browse with a result's own provider, then restore."""
+        if api is None or api is self.api:
+            yield
+            return
+        previous = (self.api, self.provider)
+        self.api = self.provider = api
+        try:
+            yield
+        finally:
+            self.api, self.provider = previous
 
     def _download_config(self, quality=None, subtitle_lang=None):
         speed = parse_speed_limit(self.settings.get('download_speed_limit'))

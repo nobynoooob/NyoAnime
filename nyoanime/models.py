@@ -35,6 +35,8 @@ class AnimeResult:
     # Stardima / multi-language metadata
     language: str = ""  # "dub" | "sub" | ""
     content_type: str = ""  # "anime" | "cartoon" | "live_action" | "unknown"
+    # Set by concurrent search so the UI can route details/episodes correctly.
+    provider_id: str = ""
 
 @dataclass
 class Episode:

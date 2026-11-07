@@ -36,6 +36,7 @@ from nyoanime.providers.language import (
     normalize_language_mode,
     provider_language_mode,
 )
+from nyoanime.providers.search import search_providers
 
 
 def clean_season(season_str: Optional[str]) -> str:
@@ -438,6 +439,16 @@ class NyoAnimeWrapper:
             history_manager=self.history
         )
 
+    def _search_all_providers(self, query: str) -> List[AnimeResult]:
+        configured = self.settings_manager.get('language_mode')
+        provider_id = getattr(self.api, 'id', '')
+        mode = (
+            normalize_language_mode(configured)
+            if configured
+            else provider_language_mode(provider_id)
+        )
+        return search_providers(query, mode=mode, timeout=5.0)
+
     def _process_anime_list(self, results: List[Any], title: str = "Select Anime"):
         if not results:
             return
@@ -518,7 +529,17 @@ class NyoAnimeWrapper:
             if not selected_anime:
                 continue
 
-            self._select_episodes(selected_anime)
+            target_api = self.api
+            provider_id = getattr(selected_anime, "provider_id", "")
+            if provider_id:
+                target_api = ProviderManager.get_provider(provider_id)
+            previous_api = self.api
+            self.api = target_api
+            try:
+                self._select_episodes(selected_anime)
+            finally:
+                if self.api is target_api:
+                    self.api = previous_api
 
     def _select_episodes(self, anime: Any):
         if self.rpc:
@@ -1272,7 +1293,7 @@ class NyoAnimeWrapper:
 
             # Standard Search Query
             with self.console.status(f"[bold blue]Searching for '{cmd}'...[/bold blue]"):
-                results = self.api.search_anime(cmd)
+                results = self._search_all_providers(cmd)
 
             if not results:
                 self.console.print(f"[yellow]No anime found matching '{cmd}'.[/yellow]")

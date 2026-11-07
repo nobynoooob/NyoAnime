@@ -19,6 +19,7 @@ from .language import (
     resolve_provider_id,
 )
 from .manager import ProviderManager
+from .search import clear_search_cache, search_providers
 
 __all__ = [
     "BaseAnimeProvider",
@@ -30,6 +31,8 @@ __all__ = [
     "StardimaProvider",
     "StardimaKidsProvider",
     "ProviderManager",
+    "search_providers",
+    "clear_search_cache",
     "DEFAULT_LANGUAGE_MODE",
     "LANGUAGE_MODES",
     "MODE_CHOICES",

@@ -253,7 +253,7 @@ def unpack_html(source: str) -> str:
 class StardimaAuth:
     """Resolve `(api_key, server_url)` from env, cache, or Remote Config."""
 
-    def __init__(self, cache_file: Optional[Path] = None, timeout: int = 12):
+    def __init__(self, cache_file: Optional[Path] = None, timeout: int = 5):
         self.cache_file = Path(cache_file) if cache_file else AUTH_CACHE_FILE
         self.timeout = timeout
         self._lock = threading.Lock()
@@ -392,7 +392,7 @@ class StardimaClient:
         self,
         auth: Optional[StardimaAuth] = None,
         session: Optional[requests.Session] = None,
-        timeout: int = 30,
+        timeout: int = 5,
     ):
         self.auth = auth or StardimaAuth()
         self.timeout = timeout
@@ -663,7 +663,7 @@ class StardimaClassifier:
 class StardimaExtractor:
     """Resolve direct media URLs from Stardima's server list across multiple hosts."""
 
-    def __init__(self, timeout: int = 8):
+    def __init__(self, timeout: int = 5):
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({
@@ -819,7 +819,7 @@ class StardimaExtractor:
                 response = self.session.head(
                     url,
                     headers=headers,
-                    timeout=min(6, self.timeout),
+                    timeout=min(5, self.timeout),
                     allow_redirects=True,
                 )
                 if response.status_code in (200, 206):
@@ -831,7 +831,7 @@ class StardimaExtractor:
                 response = self.session.get(
                     url,
                     headers={**headers, "Range": "bytes=0-0"},
-                    timeout=min(6, self.timeout),
+                    timeout=min(5, self.timeout),
                     stream=True,
                 )
                 ok = response.status_code in (200, 206)
@@ -1135,7 +1135,7 @@ class StardimaExtractor:
             return url, {"User-Agent": BROWSER_UA}, res
         headers = {"User-Agent": BROWSER_UA, "Referer": url}
         try:
-            r = self.session.get(url, headers=headers, timeout=min(6, self.timeout))
+            r = self.session.get(url, headers=headers, timeout=min(5, self.timeout))
             if r.status_code != 200:
                 return None
             text = unpack_html(r.text)

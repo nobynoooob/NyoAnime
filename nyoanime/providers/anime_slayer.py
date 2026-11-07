@@ -109,7 +109,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
         if not hasattr(self._local, "session") or self._local.session is None:
             self._local.session = requests.Session(
                 impersonate="chrome120",
-                timeout=12
+                timeout=5
             )
         return self._local.session
 
@@ -118,7 +118,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
         url = f"{self.BASE_URL}{endpoint}" if not endpoint.startswith("http") else endpoint
         t0 = time.time()
         try:
-            r = s.get(url, params=params, headers=self.HEADERS, timeout=10)
+            r = s.get(url, params=params, headers=self.HEADERS, timeout=5)
             logger.log_request("GET", url, params=params, status_code=r.status_code, duration=time.time() - t0)
             if r.status_code == 200:
                 return r.json()
@@ -132,7 +132,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
         headers = {**self.HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
         t0 = time.time()
         try:
-            r = s.post(url, data=data, headers=headers, timeout=10)
+            r = s.post(url, data=data, headers=headers, timeout=5)
             logger.log_request("POST", url, data=data, status_code=r.status_code, duration=time.time() - t0)
             if r.status_code == 200:
                 return r.json()
@@ -455,7 +455,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
             s = self._get_session()
             
             # 1. Fetch dynamic google.php seed
-            seed_res = s.get(f"{self.BASE_URL}google.php", headers=self.HEADERS, timeout=6)
+            seed_res = s.get(f"{self.BASE_URL}google.php", headers=self.HEADERS, timeout=5)
             if seed_res.status_code != 200:
                 logger.error("CRYPTO", f"Failed to fetch dynamic seed from google.php (HTTP {seed_res.status_code})")
                 return results
@@ -490,7 +490,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
             vqs_res = s.post(f"{self.BASE_URL}v-qs.php", data=post_data, headers={
                 **self.HEADERS,
                 "Content-Type": "application/x-www-form-urlencoded"
-            }, timeout=8)
+            }, timeout=5)
 
             if vqs_res.status_code == 200 and vqs_res.text.strip():
                 raw_b64 = vqs_res.text.strip()
@@ -545,7 +545,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
         """Scrape direct download stream from MediaFire page."""
         try:
             s = self._get_session()
-            r = s.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=6)
+            r = s.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=5)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, "html.parser")
                 btn = soup.find("a", {"id": "downloadButton"}) or soup.find("a", {"aria-label": "Download file"})
@@ -616,7 +616,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
         """Extract direct mp4 link from Mp4Upload page."""
         try:
             s = self._get_session()
-            r = s.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
+            r = s.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=5)
             if r.status_code == 200:
                 m = re.search(r'player\.src\({\s*type:\s*[\"\']video/mp4[\"\'],\s*src:\s*[\"\'](https?://[^\"]+)[\"\']', r.text)
                 if m:
@@ -632,7 +632,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
         """Extract master HLS stream playlist from Goodstream embed."""
         try:
             s = self._get_session()
-            r = s.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
+            r = s.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=5)
             if r.status_code == 200:
                 m = re.search(r'[\"\'](https?://[^\"\']+\.m3u8[^\"\']*)[\"\']', r.text)
                 if m:
@@ -648,7 +648,7 @@ class AnimeSlayerProvider(BaseAnimeProvider):
             if mid_match:
                 mid = mid_match.group(1)
                 s = self._get_session()
-                r = s.get(f"https://ok.ru/videoembed/{mid}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
+                r = s.get(f"https://ok.ru/videoembed/{mid}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=5)
                 if r.status_code == 200:
                     m = re.search(r'data-options=[\"\'](\{.*?\})[\"\']', r.text)
                     if m:

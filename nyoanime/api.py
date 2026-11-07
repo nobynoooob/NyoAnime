@@ -23,7 +23,7 @@ from .logger import logger
 
 BASE_URL = "https://anime3rb.com"
 DEFAULT_IMPERSONATE = "chrome120"
-DEFAULT_TIMEOUT = 15
+DEFAULT_TIMEOUT = 5
 
 
 class CDNHealthManager:
@@ -166,7 +166,7 @@ class AnimeAPI:
             
             s = self._get_session()
             try:
-                r_home = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=8)
+                r_home = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=5)
                 if r_home.status_code != 200:
                     return None, None, {}, None
                 
@@ -251,7 +251,7 @@ class AnimeAPI:
                 }
                 hdrs = dict(lw_headers)
                 hdrs["X-CSRF-TOKEN"] = tok_val
-                return s.post(ep_url, json=pl, headers=hdrs, timeout=6)
+                return s.post(ep_url, json=pl, headers=hdrs, timeout=5)
 
             # 1. Fast Primary Search pass
             try:
@@ -298,7 +298,7 @@ class AnimeAPI:
 
         # 3. Direct HTML search fallback ONLY if results genuinely match the query
         try:
-            r_fallback = s.get(f"{BASE_URL}/titles?q={query}", headers=DEFAULT_HEADERS, timeout=6)
+            r_fallback = s.get(f"{BASE_URL}/titles?q={query}", headers=DEFAULT_HEADERS, timeout=5)
             if r_fallback.status_code == 200:
                 raw_items = self._parse_search_html(r_fallback.text)
                 # Filter strictly by query keywords so we never return random catalog items
@@ -729,7 +729,7 @@ class AnimeAPI:
 
         s = self._get_session()
         try:
-            r = s.get(ep_url, headers=DEFAULT_HEADERS, timeout=6)
+            r = s.get(ep_url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return None
 
@@ -741,7 +741,7 @@ class AnimeAPI:
                 "Referer": "https://anime3rb.com/",
                 **DEFAULT_HEADERS
             }
-            r_player = s.get(player_url, headers=player_headers, timeout=6)
+            r_player = s.get(player_url, headers=player_headers, timeout=5)
             sources = []
             if r_player.status_code == 200:
                 sources = self._extract_player_sources(r_player.text)
@@ -752,7 +752,7 @@ class AnimeAPI:
                 try:
                     s_proxy = requests.Session(impersonate=DEFAULT_IMPERSONATE)
                     s_proxy.proxies = {"https": custom_proxy, "http": custom_proxy}
-                    r_proxy = s_proxy.get(player_url, headers=player_headers, timeout=6)
+                    r_proxy = s_proxy.get(player_url, headers=player_headers, timeout=5)
                     if r_proxy.status_code == 200:
                         sources = self._extract_player_sources(r_proxy.text)
                         if sources:
@@ -910,7 +910,7 @@ class AnimeAPI:
         """Fetch latest released episodes stream directly from Anime3rb homepage."""
         s = self._get_session()
         try:
-            r = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             soup = BeautifulSoup(r.text, "html.parser")
@@ -955,7 +955,7 @@ class AnimeAPI:
         """Fetch pinned / spotlight featured anime from homepage."""
         s = self._get_session()
         try:
-            r = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             
@@ -1045,7 +1045,7 @@ class AnimeAPI:
         """Fetch latest releases from Anime3rb homepage."""
         s = self._get_session()
         try:
-            r = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(BASE_URL, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1060,7 +1060,7 @@ class AnimeAPI:
         url = f"{BASE_URL}/titles/list?sort=views&sort_dir=desc&page={page}"
         s = self._get_session()
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1075,7 +1075,7 @@ class AnimeAPI:
         url = f"{BASE_URL}/titles/list?rate={rate_tier}&sort=score&sort_dir=desc&page={page}"
         s = self._get_session()
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1090,7 +1090,7 @@ class AnimeAPI:
         url = f"{BASE_URL}/titles/list/movie?page={page}"
         s = self._get_session()
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1120,7 +1120,7 @@ class AnimeAPI:
         url = f"{BASE_URL}/titles/list?season={season}&year={year}&page={page}"
         s = self._get_session()
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1135,7 +1135,7 @@ class AnimeAPI:
         url = f"{BASE_URL}/genre/{genre_slug}?page={page}"
         s = self._get_session()
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1150,7 +1150,7 @@ class AnimeAPI:
         url = f"{BASE_URL}/titles/list/{category}?page={page}"
         s = self._get_session()
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code != 200:
                 return []
             items = self._parse_anime_cards_from_html(r.text)
@@ -1225,7 +1225,7 @@ class AnimeAPI:
         s = self._get_session()
         url = f"{BASE_URL}/titles/list?creators[studio][]={s_slug}&page={page}"
         try:
-            r = s.get(url, headers=DEFAULT_HEADERS, timeout=8)
+            r = s.get(url, headers=DEFAULT_HEADERS, timeout=5)
             if r.status_code == 200:
                 cards = self._parse_anime_cards_from_html(r.text)
                 for c in cards:
