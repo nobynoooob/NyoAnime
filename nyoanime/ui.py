@@ -201,6 +201,9 @@ class UIManager:
         self.theme = self._build_theme()
         bg = _theme_color("COLOR_BACKGROUND", _DEFAULT_HOME_BG)
         self.console = Console(theme=self.theme, style=f"on {bg}")
+        # Set by NyoAnimeApp once Watch Together is available. Menus call this
+        # on every frame so the active-room banner tracks reconnects live.
+        self.room_status_provider = None
         hide_cursor()
         self.console.show_cursor(False)
 
@@ -503,7 +506,7 @@ class UIManager:
         
         return result_container.get('result')
 
-    def _home_navigation_model(self, active_provider_items):
+    def _home_navigation_model(self, active_provider_items, room_status=None):
         app_nav = [
             {"key": "w", "label": "watch together", "action": "watchtogether"},
             {"key": "l", "label": "history", "action": "history"},
@@ -511,6 +514,13 @@ class UIManager:
             {"key": "f", "label": "favorites", "action": "favorites"},
             {"key": "c", "label": "settings", "action": "settings"},
         ]
+        if isinstance(room_status, dict) and room_status.get("room_code"):
+            # "r" is already the top-rated provider shortcut, so use "v".
+            app_nav.insert(0, {
+                "key": "v",
+                "label": "return to room",
+                "action": "watchtogether",
+            })
         exit_item = {"key": "q", "label": "quit", "action": "quit"}
         app_items = app_nav + [exit_item]
 
@@ -539,7 +549,40 @@ class UIManager:
         flat = grid_items + [None] * padding + [exit_item]
         return [flat[i:i + cols] for i in range(0, len(flat), cols)]
 
-    def home_screen_menu(self, rpc_status=None, version_info=None, active_provider=None, provider=None):
+    def _room_banner_text(self, status=None):
+        """Compact always-on status strip for an active Watch Together room."""
+        provider = getattr(self, "room_status_provider", None)
+        if callable(provider):
+            # Prefer the live snapshot so a drop/reconnect shows up mid-render.
+            try:
+                status = provider()
+            except Exception:
+                status = None
+        if not isinstance(status, dict):
+            return None
+        code = str(status.get("room_code") or "").strip()
+        if not code:
+            return None
+        role = str(status.get("role") or "guest").lower()
+        label = "Hosting Room" if role == "host" else "In Room"
+        ready = bool(status.get("channels_ready") or status.get("connected"))
+        banner = Text(justify="center")
+        banner.append("● ", style=f"bold {COLOR_SUCCESS if ready else COLOR_ERROR}")
+        banner.append(f"{label}: {code}", style=f"bold {COLOR_TITLE}")
+        if not ready:
+            banner.append("  reconnecting", style=f"dim {COLOR_SUBTITLE}")
+        banner.append("   ", style="")
+        banner.append("[v] Return to Room", style=f"bold {COLOR_ACCENT}")
+        return banner
+
+    def home_screen_menu(
+        self,
+        rpc_status=None,
+        version_info=None,
+        active_provider=None,
+        provider=None,
+        room_status=None,
+    ):
         """Retro-pixel landing screen that scales with the terminal."""
         query = ""
         hovered_btn = None
@@ -582,7 +625,7 @@ class UIManager:
             if supports_feature(it["feature"])
         ]
 
-        nav = self._home_navigation_model(active_provider_items)
+        nav = self._home_navigation_model(active_provider_items, room_status=room_status)
         exit_item = nav["exit_item"]
         shortcut_items = nav["shortcut_items"]
         grid_items = nav["grid_items"]
@@ -697,6 +740,11 @@ class UIManager:
                 for _ in range(max(0, n)):
                     table.add_row(Text(""))
                     content_h += 1
+
+            banner = self._room_banner_text(room_status)
+            if banner:
+                add(Align.center(banner), 1)
+                add_gap(1)
 
             show_pattern = screen_h >= 22
             if show_pattern:
@@ -1258,12 +1306,16 @@ class UIManager:
             
             root = Table.grid(expand=False)
             root.add_column(justify="center")
+            banner = self._room_banner_text()
+            if banner:
+                root.add_row(Align.center(banner))
+                root.add_row(Text(""))
             root.add_row(Align.center(self._get_logo()))
             root.add_row(Text(""))
             root.add_row(Align.center(panel))
             root.add_row(Text(""))
             root.add_row(dock)
-            
+
             return Align.center(root, vertical="middle", height=self.console.height)
 
         self.clear()
@@ -1734,6 +1786,10 @@ class UIManager:
 
             root = Table.grid(expand=False)
             root.add_column(justify="center")
+            banner = self._room_banner_text()
+            if banner:
+                root.add_row(Align.center(banner))
+                root.add_row(Text(""))
             root.add_row(Align.center(header_table))
             root.add_row(Text(""))
             root.add_row(Align.center(body))

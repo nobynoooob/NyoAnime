@@ -96,6 +96,7 @@ class NyoAnimeApp:
         self.current_mode = "tui"
         self.force_cli = False
         self._cleaned_up = False
+        self._watch_together_ui = None
 
     def _sync_active_provider(self):
         """Re-resolve the provider from language settings and refresh both handles."""
@@ -103,6 +104,23 @@ class NyoAnimeApp:
         self.provider = ProviderManager.get_provider(provider_id)
         self.api = self.provider
         return provider_id
+
+    def _watch_together(self):
+        """Single persistent Watch Together owner for the whole process."""
+        if self._watch_together_ui is None:
+            from .ui_watchtogether import WatchTogetherUI
+
+            self._watch_together_ui = WatchTogetherUI(
+                self.ui,
+                browse_callback=self.browse_anime_for_watch_together,
+            )
+            self.ui.room_status_provider = self._watch_together_ui.room_status
+        return self._watch_together_ui
+
+    def _room_status(self):
+        if self._watch_together_ui is None:
+            return None
+        return self._watch_together_ui.room_status()
 
     def run(self):
         parser = argparse.ArgumentParser(
@@ -283,6 +301,7 @@ class NyoAnimeApp:
                     version_info=self.version_info,
                     active_provider=provider_name,
                     provider=self.api,
+                    room_status=self._room_status(),
                 )
 
             if action in ["quit", "exit"] or action is None:
@@ -400,19 +419,10 @@ class NyoAnimeApp:
                 continue
 
             elif action == "watchtogether":
-                # Start Watch Together mode
-                from .ui_watchtogether import WatchTogetherUI
-
                 try:
-                    # One UI manager so Watch Together shares the live theme,
-                    # logo and menu language with the rest of NyoAnime. The
-                    # browse callback reuses the normal search/anime/episode
-                    # menus without tearing down the room transport.
-                    wwt_ui = WatchTogetherUI(
-                        self.ui,
-                        browse_callback=self.browse_anime_for_watch_together,
-                    )
-                    wwt_ui.handle_watch_together(self.api)
+                    # One persistent owner: [b] returns here without dropping
+                    # the room, and [v] jumps back into it.
+                    self._watch_together().handle_watch_together(self.api)
                 except KeyboardInterrupt:
                     continue
                 except Exception:
@@ -809,6 +819,9 @@ class NyoAnimeApp:
                         else:
                             # User pressed Back/ESC/q: return cleanly to History
                             return
+                    return
+                if action_taken == "watchtogether":
+                    # Host room playback is already running in the background.
                     return
             else:
                 self.handle_episode_selection(selected_anime, episodes, initial_idx=initial_idx)
@@ -1264,6 +1277,10 @@ class NyoAnimeApp:
                 elif action_taken == "download":
                     # For downloads, return directly to the episodes list instead of watch navigation.
                     break
+                elif action_taken == "watchtogether":
+                    # Room playback runs in the background; skip the blocking
+                    # post-watch menu and hand the terminal back to the menus.
+                    break
                 else:
                     break
 
@@ -1670,6 +1687,61 @@ class NyoAnimeApp:
             playback_url = quality.master_url
             playback_bitrate = int(getattr(quality, 'bandwidth', 0) or 0)
         time_hint = f" • Resuming at {format_seconds(actual_start)}" if (actual_start > 0) else ""
+
+        # A room host picking from the normal menus owns the room playback too:
+        # broadcast the stream, then drive the room's MPV/SyncEngine instead of
+        # starting a second, unlinked player.
+        if self._watch_together_ui is not None and self._room_status():
+            selection = {
+                "anime": selected_anime,
+                "episode": selected_ep,
+                "provider_id": getattr(self.provider, "id", ""),
+                "language_mode": language_mode,
+            }
+            reference = self._watch_together_ui._selection_reference(selection)
+            playback_payload = {
+                "url": str(playback_url),
+                "title": f"{selected_anime.title_en} - Ep {selected_ep.display_num}",
+                "episode_number": str(selected_ep.display_num),
+                "episode_title": str(getattr(selected_ep, "title", "") or ""),
+                "headers": dict(headers or {}),
+                "start_time": float(actual_start or 0.0),
+                "audio_lang": audio_lang,
+                "subtitle_url": subtitle_url,
+                "subtitle_lang": subtitle_lang,
+                "audio_url": getattr(quality, "audio_url", "") or "",
+                "subtitles_disabled": subtitles_disabled,
+                "hls_bitrate": playback_bitrate,
+                "quality": quality_tag,
+                "provider_id": getattr(self.provider, "id", ""),
+                "anime_id": getattr(selected_anime, "id", ""),
+            }
+            if reference and self._watch_together_ui.play_from_menu(
+                playback_payload, reference
+            ):
+                self.ui.render_now_playing(
+                    selected_anime.title_en,
+                    f"Episode {selected_ep.display_num}{time_hint}",
+                    quality.name,
+                )
+                self.rpc.update_watching(
+                    selected_anime.title_en,
+                    str(selected_ep.display_num),
+                    selected_anime.thumbnail,
+                )
+                self.history.mark_watched(
+                    selected_anime.id,
+                    selected_ep.display_num,
+                    selected_anime.title_en,
+                    poster_url=getattr(selected_anime, "thumbnail", ""),
+                    provider=getattr(self.provider, "id", ""),
+                    language_mode=language_mode,
+                )
+                self.rpc.update_selecting_episode(
+                    selected_anime.title_en, selected_anime.thumbnail
+                )
+                return "watchtogether"
+
         self.ui.render_now_playing(
             selected_anime.title_en,
             f"Episode {selected_ep.display_num}{time_hint}",
@@ -1767,6 +1839,12 @@ class NyoAnimeApp:
         if self._cleaned_up:
             return
         self._cleaned_up = True
+
+        try:
+            if self._watch_together_ui is not None:
+                self._watch_together_ui.shutdown()
+        except Exception:
+            logger.warning("Watch Together cleanup failed", exc_info=True)
 
         try:
             self.rpc.disconnect()

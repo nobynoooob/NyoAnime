@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -161,6 +162,727 @@ class _RoomPlayback:
             self.on_error(exc)
 
 
+class _RoomRuntime:
+    """Owns one room's client state beyond the lifetime of its screen.
+
+    The runtime lives on a dedicated asyncio loop. Opening the room view just
+    attaches a renderer/key loop to it; backing out to the main menu leaves the
+    Supabase subscriptions, MPV session and sync heartbeat running.
+    """
+
+    def __init__(
+        self,
+        owner: "WatchTogetherUI",
+        client: WTRClient,
+        initial_error: Optional[str] = None,
+        technical_error: Optional[str] = None,
+        notice: Optional[str] = None,
+    ):
+        self.owner = owner
+        self.client = client
+        self.role = str(getattr(client, "role", "guest") or "guest").lower()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._bg_task: Optional[asyncio.Task] = None
+        self._state_task: Optional[asyncio.Task] = None
+        self._retry_task: Optional[asyncio.Task] = None
+        self._playback_task: Optional[asyncio.Task] = None
+        self._subscriptions: List[Tuple[str, Callable[[Any], None]]] = []
+        self._closed = False
+        self._stopped = False
+        self._foreground = False
+        self._dirty = True
+        self._status_lock = threading.Lock()
+        self._status: Dict[str, Any] = {}
+
+        self.state: Optional[Dict[str, Any]] = None
+        if hasattr(client, "local_room_state"):
+            try:
+                self.state = client.local_room_state()
+            except Exception:
+                self.state = None
+        self.state_error: Optional[str] = None
+        self.leave_error: Optional[str] = None
+        self.error = initial_error
+        self.technical = technical_error or getattr(client, "channel_error", None)
+        self.notice = notice or ""
+        self.notice_until = time.monotonic() + 4.0 if self.notice else 0.0
+        self.show_diagnostics = False
+        self.busy = ""
+        self.selected_reference: Optional[Dict[str, str]] = None
+        self.selected_playback: Optional[Dict[str, Any]] = None
+        self.pending_share = False
+        self.was_ready = bool(getattr(client, "channels_ready", False))
+        self.spinner_frame = 0
+        self.left = False
+        self.quit_requested = False
+        self.next_refresh = time.monotonic() + _STATE_REFRESH_SECONDS
+        self.next_retry = time.monotonic() + _RECONNECT_RETRY_SECONDS
+
+        self.playback = _RoomPlayback(
+            self.role,
+            send_callback=self._send_sync,
+            on_error=self._on_playback_error,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        if hasattr(self.client, "subscribe"):
+            for event, handler in (
+                (PartyEvent.EPISODE_CHANGED.value, self._on_episode_changed),
+                (PartyEvent.ROOM_STATE.value, self._on_room_state),
+                (PartyEvent.SYNC_PLAYBACK.value, self._on_sync_playback),
+            ):
+                try:
+                    self.client.subscribe(event, handler)
+                    self._subscriptions.append((event, handler))
+                except Exception:
+                    pass
+        start_poll = getattr(self.client, "start_playback_poll", None)
+        if callable(start_poll):
+            try:
+                start_poll()
+            except Exception:
+                pass
+        self._update_status()
+        self._bg_task = self._loop.create_task(self._background_loop())
+        if getattr(self.client, "room_active", False):
+            self._state_task = self._loop.create_task(self.client.get_room_state())
+
+    async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        self._closed = True
+        for task in (self._bg_task, self._state_task, self._retry_task, self._playback_task):
+            await self._cancel_task(task)
+        self._bg_task = self._state_task = self._retry_task = self._playback_task = None
+        await self.playback.stop()
+        stop_poll = getattr(self.client, "stop_playback_poll", None)
+        if callable(stop_poll):
+            try:
+                stop_poll()
+            except Exception:
+                pass
+        if hasattr(self.client, "unsubscribe"):
+            for event, handler in self._subscriptions:
+                try:
+                    self.client.unsubscribe(event, handler)
+                except Exception:
+                    pass
+        self._subscriptions.clear()
+
+    def configure(
+        self,
+        initial_error: Optional[str] = None,
+        technical_error: Optional[str] = None,
+        notice: Optional[str] = None,
+    ) -> None:
+        if initial_error is not None:
+            self.error = initial_error
+        if technical_error is not None:
+            self.technical = technical_error
+        if notice:
+            self.notice = notice
+            self.notice_until = time.monotonic() + 4.0
+        self._dirty = True
+
+    # ------------------------------------------------------------------
+    # Background maintenance
+    # ------------------------------------------------------------------
+    async def _background_loop(self) -> None:
+        try:
+            while not self._closed:
+                try:
+                    await self._tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Watch Together background tick failed", exc_info=True)
+                await asyncio.sleep(
+                    _STATUS_POLL_SECONDS if self._foreground else 0.25
+                )
+        except asyncio.CancelledError:
+            raise
+
+    async def _tick(self) -> None:
+        now = time.monotonic()
+        if self.notice and self.notice_until and now >= self.notice_until:
+            self.notice = ""
+            self.notice_until = 0.0
+            self._dirty = True
+
+        if self._state_task is not None and self._state_task.done():
+            try:
+                self.state = self._state_task.result()
+                self.state_error = None
+                if self.notice.startswith(("Refreshing", "We couldn't refresh")):
+                    self.notice = ""
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.state_error = self.owner._describe_error(exc)
+                if not self.notice:
+                    self.notice = (
+                        "We couldn't refresh the member list. Press [r] to try again."
+                    )
+                    self.notice_until = now + 4.0
+            self._state_task = None
+            self.next_refresh = now + _STATE_REFRESH_SECONDS
+            self._dirty = True
+
+        if (
+            self._state_task is None
+            and getattr(self.client, "channels_ready", False)
+            and now >= self.next_refresh
+        ):
+            self._state_task = self._loop.create_task(self.client.get_room_state())
+            self.next_refresh = now + _STATE_REFRESH_SECONDS
+
+        if self._retry_task is not None and self._retry_task.done():
+            try:
+                self._retry_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._retry_task = None
+            self.next_retry = now + _RECONNECT_RETRY_SECONDS
+            self._dirty = True
+
+        if self._playback_task is not None and self._playback_task.done():
+            try:
+                self._playback_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.set_notice(self.owner._playback_error_notice(exc))
+            self._playback_task = None
+            self.busy = ""
+            self._dirty = True
+
+        ready_now = bool(getattr(self.client, "channels_ready", False))
+        if (
+            self._retry_task is None
+            and not ready_now
+            and not self.busy
+            and getattr(self.client, "room_active", False)
+            and now >= self.next_retry
+        ):
+            self._retry_task = self._loop.create_task(
+                self.client.retry_connection()
+            )
+            self.next_retry = now + _RECONNECT_RETRY_SECONDS
+
+        if self.busy or not ready_now:
+            self.spinner_frame = int(now * 9)
+
+        if getattr(self.client, "channels_ready", False) and self.error:
+            self.error = None
+            self.technical = getattr(self.client, "channel_error", None) or self.technical
+            self.set_notice("Connected again.")
+
+        if ready_now and not self.was_ready and self.pending_share:
+            await self.share_selection()
+        elif ready_now and not self.was_ready and not self.notice:
+            self.set_notice("Connected again.")
+        self.was_ready = ready_now
+        self._update_status()
+
+    # ------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------
+    def _spawn(self, coro) -> None:
+        try:
+            if self._loop is not None and self._loop.is_running():
+                self._loop.create_task(coro)
+            else:
+                asyncio.ensure_future(coro)
+        except RuntimeError:
+            logger.debug("Watch Together event arrived after the room stopped")
+
+    def _on_episode_changed(self, message: Any) -> None:
+        # Update the visible pick synchronously; only the MPV swap is async.
+        reference = self.owner._reference_from_message(message)
+        if not reference:
+            return
+        self.selected_reference = reference
+        incoming_playback = self.owner._playback_from_message(message)
+        if str(getattr(self.client, "role", "guest") or "guest").lower() != "host":
+            self.set_notice(f"Host picked: {self.owner._selection_label(reference)}")
+            if incoming_playback:
+                self.selected_playback = incoming_playback
+                self.queue_playback(incoming_playback, reference)
+            else:
+                self.selected_playback = None
+                self._spawn(self._stop_guest_playback())
+        else:
+            if incoming_playback:
+                self.selected_playback = incoming_playback
+        self._dirty = True
+
+    async def _stop_guest_playback(self) -> None:
+        await self._cancel_task(self._playback_task)
+        self._playback_task = None
+        await self.playback.stop()
+
+    def _on_sync_playback(self, message: Any) -> None:
+        if not self.playback.active:
+            return
+        payload = (
+            message.get("payload")
+            if isinstance(message, dict)
+            else getattr(message, "payload", None)
+        )
+        if isinstance(payload, dict):
+            self._spawn(self.playback.apply_sync(payload))
+
+    def _on_room_state(self, message: Any) -> None:
+        reference = self.owner._reference_from_message(message)
+        if reference and reference != self.selected_reference:
+            self.selected_reference = reference
+            self._dirty = True
+
+    async def _send_sync(self, payload: Dict[str, Any]) -> None:
+        await self.client.send_event(PartyEvent.SYNC_PLAYBACK.value, payload)
+
+    def _on_playback_error(self, exc: Exception) -> None:
+        self.set_notice(self.owner._playback_error_notice(exc))
+
+    def set_notice(self, value: str) -> None:
+        self.notice = value
+        self.notice_until = time.monotonic() + 4.0 if value else 0.0
+        self._dirty = True
+
+    # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
+    def queue_playback(
+        self,
+        playback: Optional[Dict[str, Any]],
+        reference: Optional[Dict[str, Any]],
+    ) -> None:
+        if not playback or not isinstance(reference, dict):
+            return
+        if self._playback_task is not None and not self._playback_task.done():
+            self._playback_task.cancel()
+        self.busy = "Resolving stream & launching MPV..."
+        self._playback_task = self._loop.create_task(
+            self.playback.start(playback, reference)
+        )
+        self._dirty = True
+
+    async def play_episode(
+        self,
+        playback: Dict[str, Any],
+        reference: Dict[str, Any],
+    ) -> None:
+        """Host a stream picked from the normal anime menus."""
+        self.selected_reference = reference
+        self.selected_playback = playback
+        self._dirty = True
+        await self.share_selection()
+        self.queue_playback(playback, reference)
+
+    async def share_selection(self) -> bool:
+        reference = self.selected_reference
+        if (
+            reference is None
+            or not getattr(self.client, "channels_ready", False)
+            or not hasattr(self.client, "send_event")
+        ):
+            self.pending_share = True
+            return False
+        label = self.owner._selection_label(reference)
+        payload: Dict[str, Any] = {"anime_reference": reference}
+        broadcast_playback = self.owner._broadcast_playback(self.selected_playback)
+        if broadcast_playback:
+            payload["playback"] = broadcast_playback
+            payload["stream_url"] = broadcast_playback.get("url")
+            payload["title"] = (
+                broadcast_playback.get("title") or reference.get("title")
+            )
+            payload["episode_number"] = (
+                broadcast_playback.get("episode_number")
+                or reference.get("episode_number")
+            )
+            if broadcast_playback.get("headers"):
+                payload["headers"] = broadcast_playback["headers"]
+        try:
+            broadcaster = getattr(self.client, "broadcast_playback", None)
+            if broadcast_playback and callable(broadcaster):
+                await broadcaster(broadcast_playback, reference)
+            else:
+                await self.client.send_event(
+                    PartyEvent.EPISODE_CHANGED.value, payload
+                )
+        except Exception as exc:
+            _, message, _ = self.owner._friendly_error(exc, "room")
+            logger.warning("Watch Together selection broadcast failed: %s", message)
+            self.pending_share = True
+            self.set_notice(
+                "Picked it. Will share when the connection returns."
+                if self.owner.console.width < 56
+                else f"Picked {label}, but couldn't share it yet. "
+                "It will be shared automatically when the room reconnects."
+            )
+            return False
+        self.pending_share = False
+        self.set_notice(
+            f"Shared: {label}"
+            if self.owner.console.width < 56
+            else f"Room pick shared: {label}."
+        )
+        return True
+
+    async def _cancel_task(self, task: Optional[asyncio.Task]) -> None:
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # ------------------------------------------------------------------
+    # View
+    # ------------------------------------------------------------------
+    def view_model(self, busy_override: str = "") -> Dict[str, Any]:
+        return self.owner.room_view_model(
+            self.client,
+            state=self.state,
+            state_error=self.state_error,
+            notice=self.notice,
+            leave_error=self.leave_error,
+            initial_error=self.error,
+            technical_error=getattr(self.client, "channel_error", None) or self.technical,
+            show_diagnostics=self.show_diagnostics,
+            busy=busy_override or self.busy,
+            selection=self.selected_reference,
+            spinner_frame=self.spinner_frame,
+        )
+
+    def _view(self, busy_override: str = ""):
+        return self.owner._build_room_view(
+            self.view_model(busy_override), self.show_diagnostics
+        )
+
+    def _status_tuple(self) -> Tuple:
+        return (
+            bool(getattr(self.client, "connected", False)),
+            bool(getattr(self.client, "channels_ready", False)),
+            getattr(self.client, "channel_error", None),
+            self.busy,
+            self.show_diagnostics,
+            self.error,
+            self.leave_error,
+            self.notice,
+            len((self.state or {}).get("participants") or []),
+            self.selected_reference,
+            self.spinner_frame,
+        )
+
+    async def run_ui(self) -> bool:
+        """Foreground room screen. Returns True after a confirmed leave."""
+        self._foreground = True
+        self._dirty = True
+        self.left = False
+        self.quit_requested = False
+        last_status = None
+        last_size = (self.owner.console.width, self.owner.console.height)
+        try:
+            with RawTerminal():
+                with Live(
+                    self._view(),
+                    console=self.owner.console,
+                    screen=True,
+                    auto_refresh=False,
+                    refresh_per_second=10,
+                ) as live:
+                    while not self._closed:
+                        size = (self.owner.console.width, self.owner.console.height)
+                        status = self._status_tuple()
+                        if self._dirty or status != last_status or size != last_size:
+                            last_status = status
+                            last_size = size
+                            self._dirty = False
+                            live.update(self._view(), refresh=True)
+
+                        key = get_key()
+
+                        if key in ("l", "L", "q", "Q"):
+                            wants_quit = key in ("q", "Q")
+                            await self._cancel_task(self._playback_task)
+                            self._playback_task = None
+                            self.busy = "Leaving the room..."
+                            await self.playback.stop()
+                            leave_task = asyncio.create_task(self.client.leave_room())
+                            frame = 0
+                            while not leave_task.done():
+                                frame += 1
+                                live.update(
+                                    self._view("Leaving the room..."),
+                                    refresh=True,
+                                )
+                                await asyncio.sleep(0.08)
+                            self.busy = ""
+                            try:
+                                leave_task.result()
+                            except Exception as exc:
+                                _, message, technical = self.owner._friendly_error(
+                                    exc, "leave"
+                                )
+                                self.leave_error = message
+                                self.technical = technical
+                                self.set_notice("")
+                            else:
+                                self.left = True
+                                self.quit_requested = wants_quit
+                                break
+
+                        elif key in ("b", "B"):
+                            # Deliberately leave the runtime untouched: the room
+                            # stays hosted while the main menu is in use.
+                            break
+
+                        elif key in ("r", "R"):
+                            if getattr(self.client, "channels_ready", False):
+                                if self._state_task is None:
+                                    self.set_notice("Refreshing members...")
+                                    self._state_task = asyncio.create_task(
+                                        self.client.get_room_state()
+                                    )
+                                    self.next_refresh = (
+                                        time.monotonic() + _STATE_REFRESH_SECONDS
+                                    )
+                                else:
+                                    self.set_notice("Members are already refreshing.")
+                            elif self._retry_task is None:
+                                self.next_retry = time.monotonic()
+                                self.set_notice("Reconnecting...")
+                            else:
+                                self.set_notice("Already reconnecting.")
+
+                        elif key in ("c", "C"):
+                            code = getattr(self.client, "room_code", None)
+                            if code:
+                                if self.owner._copy_to_clipboard(str(code)):
+                                    self.set_notice("Room code copied.")
+                                else:
+                                    self.set_notice(
+                                        "Copy isn't available here. Share the code manually."
+                                    )
+                            else:
+                                self.set_notice("There is no room code to copy yet.")
+
+                        elif key in ("i", "I"):
+                            self.show_diagnostics = not self.show_diagnostics
+                            self.set_notice("")
+
+                        elif key == "ESC":
+                            if self.show_diagnostics:
+                                self.show_diagnostics = False
+                                self._dirty = True
+                            else:
+                                guest_hint = (
+                                    "Press [b] for the main menu, [l] to leave, "
+                                    "[i] for details, or [q] to quit."
+                                )
+                                host_hint = (
+                                    "Press [b] for the main menu, [l] to leave, "
+                                    "[i] for details, or [q] to quit."
+                                )
+                                self.set_notice(
+                                    host_hint if self.role == "host" else guest_hint
+                                )
+
+                        await asyncio.sleep(_STATUS_POLL_SECONDS)
+        finally:
+            self._foreground = False
+            self.owner._quit_requested = self.quit_requested
+        return self.left
+
+    # ------------------------------------------------------------------
+    # Status snapshot (safe to read from the UI thread)
+    # ------------------------------------------------------------------
+    def _update_status(self) -> None:
+        snapshot = {
+            "room_code": getattr(self.client, "room_code", None),
+            "room_id": getattr(self.client, "room_id", None),
+            "role": str(getattr(self.client, "role", "guest") or "guest").lower(),
+            "connected": bool(getattr(self.client, "connected", False)),
+            "channels_ready": bool(getattr(self.client, "channels_ready", False)),
+            "transport": getattr(self.client, "transport_kind", "unknown"),
+        }
+        with self._status_lock:
+            self._status = snapshot
+
+    def status(self) -> Dict[str, Any]:
+        with self._status_lock:
+            return dict(self._status)
+
+
+class WatchTogetherSession:
+    """A room runtime kept alive on its own asyncio loop thread."""
+
+    def __init__(self, owner: "WatchTogetherUI", api):
+        self.owner = owner
+        self.api = api
+        self.client: Optional[WTRClient] = None
+        self.runtime: Optional[_RoomRuntime] = None
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="nyo-watchtogether",
+            daemon=True,
+        )
+        self._closed = False
+        self._thread.start()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_forever()
+        finally:
+            try:
+                pending = asyncio.all_tasks(self._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
+            self._loop.close()
+
+    def submit(self, coro, timeout: Optional[float] = None):
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout)
+
+    @property
+    def active(self) -> bool:
+        client = self.client
+        return (
+            not self._closed
+            and self.runtime is not None
+            and client is not None
+            and bool(getattr(client, "room_active", False))
+        )
+
+    @property
+    def has_room(self) -> bool:
+        client = self.client
+        return client is not None and bool(getattr(client, "room_active", False))
+
+    def status(self) -> Dict[str, Any]:
+        runtime = self.runtime
+        if runtime is None:
+            return {}
+        return runtime.status()
+
+    def connect(self, room_code: Optional[str] = None) -> Optional[BaseException]:
+        try:
+            self.submit(self._connect(room_code))
+            return None
+        except KeyboardInterrupt:
+            self.shutdown(emergency=True)
+            raise
+        except Exception as exc:
+            return exc
+
+    async def _connect(self, room_code: Optional[str]) -> None:
+        client = self.owner._client_factory(self.owner._nickname())
+        self.client = client
+        try:
+            steps: List[Tuple[str, Callable[[], Awaitable[Any]]]] = [
+                ("Connecting to Watch Together...", lambda: client.connect())
+            ]
+            if room_code:
+                steps.append(
+                    (
+                        f"Joining room {room_code}...",
+                        lambda: client.join_room(room_code),
+                    )
+                )
+            else:
+                steps.append(("Opening your room...", lambda: client.create_room()))
+            await self.owner._run_steps(steps)
+        finally:
+            if getattr(client, "room_active", False):
+                self.runtime = _RoomRuntime(self.owner, client)
+                await self.runtime.start()
+        if self.runtime is None:
+            raise RuntimeError("Room did not open")
+
+    def open_room(self) -> bool:
+        runtime = self.runtime
+        if runtime is None or self._closed:
+            return True
+        return bool(self.submit(runtime.run_ui()))
+
+    def play_episode(
+        self,
+        playback: Dict[str, Any],
+        reference: Dict[str, Any],
+    ) -> bool:
+        runtime = self.runtime
+        if not self.active or runtime is None or runtime.role != "host":
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                runtime.play_episode(playback, reference), self._loop
+            )
+        except RuntimeError:
+            return False
+        future.add_done_callback(self._log_future)
+        return True
+
+    @staticmethod
+    def _log_future(future) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logger.warning("Watch Together playback handoff failed: %s", exc)
+
+    def shutdown(self, emergency: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.submit(self._shutdown(emergency), timeout=25.0)
+        except Exception:
+            logger.warning("Watch Together shutdown was not clean", exc_info=True)
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:
+            pass
+        self._thread.join(timeout=5.0)
+
+    async def _shutdown(self, emergency: bool) -> None:
+        runtime = self.runtime
+        if runtime is not None:
+            await runtime.stop()
+        client = self.client
+        if client is None:
+            return
+        if getattr(client, "room_active", False):
+            try:
+                await asyncio.wait_for(
+                    client.leave_room(),
+                    timeout=6.0 if emergency else 12.0,
+                )
+            except Exception as exc:
+                logger.warning("Watch Together leave during shutdown failed: %s", exc)
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
 class WatchTogetherUI:
     """UI components and session ownership for Watch Together."""
 
@@ -180,8 +902,11 @@ class WatchTogetherUI:
         # None when the user backs out), while this screen keeps the room alive.
         self._browse_callback = browse_callback
         self._api = None
-        # Set when the room screen is closed with [q]; the session loop uses it
-        # to leave Watch Together instead of falling back to its menu.
+        # Persistent room session. It survives returning to the main menu; only
+        # Leave Room / Quit tears it down.
+        self._session: Optional[WatchTogetherSession] = None
+        self._session_lock = threading.RLock()
+        # Set when the room screen is closed with [q].
         self._quit_requested = False
         _sync_theme_colors()
 
@@ -189,25 +914,124 @@ class WatchTogetherUI:
     # Session entry point
     # ------------------------------------------------------------------
     def handle_watch_together(self, api) -> None:
-        """Run the whole Watch Together session on one event loop."""
+        """Open the room, or launch the host/join flow if there isn't one."""
         self._api = api
         self._quit_requested = False
-        asyncio.run(self._session_loop(api))
 
-    async def _session_loop(self, api) -> None:
+        with self._session_lock:
+            existing = self._session
+            if existing is not None and existing.active:
+                self._open_room()
+                return
+            if existing is not None:
+                self._session = None
+                existing.shutdown()
+
         notice = ""
         while True:
             choice = self.watch_together_menu(notice=notice)
             notice = ""
+            if choice not in ("host", "join"):
+                return
 
-            if choice == "host":
-                _, notice = await self._create_room_flow()
-            elif choice == "join":
-                _, notice = await self._join_room_flow()
-            else:
+            code = None
+            if choice == "join":
+                code = self._code_entry_screen()
+                if not code:
+                    continue
+
+            session = WatchTogetherSession(self, api)
+            error = session.connect(code)
+            if error is None:
+                self._session = session
+                self._open_room(notice=(
+                    "You're in. Waiting for the host to start."
+                    if code
+                    else "Your room is ready. Share the code with friends."
+                ))
                 return
-            if self._quit_requested:
+
+            action = "join" if code else "create"
+            title, message, technical = self._friendly_error(error, action)
+            if session.has_room:
+                # The room exists; only live updates failed. Keep it viewable
+                # so the user can share the code or retry from inside.
+                self._session = session
+                self._open_room(
+                    initial_error=message,
+                    technical_error=technical,
+                    notice=(
+                        "You're in the room."
+                        if code
+                        else "Your room code is ready. Share it with friends."
+                    ),
+                )
                 return
+
+            session.shutdown(emergency=True)
+            logger.warning(
+                "Watch Together %s failed: %s",
+                action,
+                sanitize_diagnostic(str(error)),
+            )
+            if code and self._is_code_error(error):
+                notice = message
+                continue
+            if self._error_screen(
+                title, message, retry=self._can_retry(error)
+            ) != "retry":
+                return
+
+    # ------------------------------------------------------------------
+    # Persistent session bridge
+    # ------------------------------------------------------------------
+    def room_status(self) -> Optional[Dict[str, Any]]:
+        """Snapshot used by the main-menu banner and the return shortcut."""
+        session = self._session
+        if session is None or not session.active:
+            return None
+        status = session.status()
+        return status if status.get("room_code") else None
+
+    def play_from_menu(
+        self,
+        playback: Dict[str, Any],
+        reference: Dict[str, Any],
+    ) -> bool:
+        """Link a main-menu episode to the room (host only)."""
+        session = self._session
+        if session is None:
+            return False
+        return session.play_episode(playback, reference)
+
+    def shutdown(self) -> None:
+        with self._session_lock:
+            session, self._session = self._session, None
+        if session is not None:
+            session.shutdown()
+
+    def _open_room(self, **kwargs) -> None:
+        session = self._session
+        if session is None or session.runtime is None:
+            return
+        session.runtime.configure(**kwargs)
+        try:
+            left = session.open_room()
+        except KeyboardInterrupt:
+            session.shutdown(emergency=True)
+            if self._session is session:
+                self._session = None
+            raise
+        except Exception:
+            logger.error("Watch Together room screen failed", exc_info=True)
+            session.shutdown(emergency=True)
+            if self._session is session:
+                self._session = None
+            raise
+        if left:
+            session.shutdown()
+            if self._session is session:
+                self._session = None
 
     # ------------------------------------------------------------------
     # Menus and shared rendering
@@ -633,104 +1457,6 @@ class WatchTogetherUI:
     # ------------------------------------------------------------------
     # Create / join flows
     # ------------------------------------------------------------------
-    async def _create_room_flow(self) -> Tuple[bool, str]:
-        nickname = self._nickname()
-        import sys
-        import traceback
-
-        while True:
-            client = self._client_factory(nickname)
-            try:
-                await self._run_steps([
-                    ("Connecting to Watch Together...", lambda c=client: c.connect()),
-                    ("Opening your room...", lambda c=client: c.create_room()),
-                ])
-            except KeyboardInterrupt:
-                await self._emergency_leave(client)
-                await self._safe_close(client)
-                raise
-            except Exception as exc:
-                print(f"[ERROR] Watch Together room creation failed:\n{traceback.format_exc()}", file=sys.stderr)
-                logger.warning(
-                    "Watch Together create failed: %s: %s",
-                    type(exc).__name__,
-                    sanitize_diagnostic(str(exc)),
-                )
-                title, message, technical = self._friendly_error(exc, "create")
-                if getattr(client, "room_active", False):
-                    left = await self._guard_room_screen(
-                        client,
-                        initial_error=message,
-                        technical_error=technical,
-                        notice="Your room code is ready. Share it with friends.",
-                    )
-                    return left, "You left the room." if left else ""
-                await self._safe_close(client)
-                action = self._error_screen(
-                    title, message, retry=self._can_retry(exc)
-                )
-                if action == "retry":
-                    continue
-                return False, ""
-
-            left = await self._guard_room_screen(
-                client,
-                notice="Your room is ready. Share the code with friends.",
-            )
-            return left, "You left the room." if left else ""
-
-    async def _join_room_flow(self) -> Tuple[bool, str]:
-        nickname = self._nickname()
-        code = self._code_entry_screen()
-        import sys
-        import traceback
-
-        while code:
-            client = self._client_factory(nickname)
-            try:
-                await self._run_steps([
-                    ("Connecting to Watch Together...", lambda c=client: c.connect()),
-                    (f"Joining room {code}...", lambda c=client, r=code: c.join_room(r)),
-                ])
-            except KeyboardInterrupt:
-                await self._emergency_leave(client)
-                await self._safe_close(client)
-                raise
-            except Exception as exc:
-                print(f"[ERROR] Watch Together room join failed:\n{traceback.format_exc()}", file=sys.stderr)
-                logger.warning(
-                    "Watch Together join failed: %s: %s",
-                    type(exc).__name__,
-                    sanitize_diagnostic(str(exc)),
-                )
-                title, message, technical = self._friendly_error(exc, "join")
-                if getattr(client, "room_active", False):
-                    left = await self._guard_room_screen(
-                        client,
-                        initial_error=message,
-                        technical_error=technical,
-                        notice="You're in the room.",
-                    )
-                    return left, "You left the room." if left else ""
-                await self._safe_close(client)
-                if self._is_code_error(exc):
-                    # Typos go straight back to the slots; no extra error screen.
-                    code = self._code_entry_screen(initial_code=code, notice=message)
-                    continue
-                if self._error_screen(
-                    title, message, retry=self._can_retry(exc)
-                ) != "retry":
-                    return False, ""
-
-            else:
-                left = await self._guard_room_screen(
-                    client,
-                    notice="You're in. Waiting for the host to start.",
-                )
-                return left, "You left the room." if left else ""
-
-        return False, ""
-
     async def _guard_room_screen(
         self,
         client: WTRClient,
@@ -875,526 +1601,30 @@ class WatchTogetherUI:
         initial_error: Optional[str] = None,
         technical_error: Optional[str] = None,
         notice: Optional[str] = None,
+        runtime: Optional[_RoomRuntime] = None,
     ) -> bool:
-        self._quit_requested = False
-        state: Optional[Dict[str, Any]] = None
-        if hasattr(client, "local_room_state"):
-            try:
-                state = client.local_room_state()
-            except Exception:
-                state = None
-
-        state_error: Optional[str] = None
-        leave_error: Optional[str] = None
-        error = initial_error
-        technical = technical_error or getattr(client, "channel_error", None)
-        notice = notice or ""
-        notice_until = time.monotonic() + 4.0 if notice else 0.0
-        show_diagnostics = False
-        busy = ""
-        dirty = True
-        state_task: Optional[asyncio.Task] = None
-        last_status = None
-        last_size = (self.console.width, self.console.height)
-        next_refresh = time.monotonic()
-        left = False
-        selected_reference: Optional[Dict[str, str]] = None
-        selected_playback: Optional[Dict[str, Any]] = None
-        playback_task: Optional[asyncio.Task] = None
-        pending_share = False
-        was_ready = bool(getattr(client, "channels_ready", False))
-        subscriptions: List[Tuple[str, Callable[[Any], None]]] = []
-        quit_requested = False
-        spinner_frame = 0
-        retry_task: Optional[asyncio.Task] = None
-        next_retry = time.monotonic() + _RECONNECT_RETRY_SECONDS
-
-        def model(current_notice: str = "", current_busy: str = ""):
-            live_error = getattr(client, "channel_error", None)
-            return self.room_view_model(
+        """Render the room. ``False`` means "back to menu" without leaving."""
+        owns_runtime = runtime is None
+        if runtime is None:
+            runtime = _RoomRuntime(
+                self,
                 client,
-                state=state,
-                state_error=state_error,
-                notice=current_notice or notice,
-                leave_error=leave_error,
-                initial_error=error,
-                technical_error=live_error or technical,
-                show_diagnostics=show_diagnostics,
-                busy=current_busy or busy,
-                selection=selected_reference,
-                spinner_frame=spinner_frame,
+                initial_error=initial_error,
+                technical_error=technical_error,
+                notice=notice,
             )
-
-        def set_notice(value: str) -> None:
-            nonlocal notice, notice_until, dirty
-            notice = value
-            notice_until = time.monotonic() + 4.0 if value else 0.0
-            dirty = True
-
-        async def send_sync(payload: Dict[str, Any]) -> None:
-            await client.send_event(PartyEvent.SYNC_PLAYBACK.value, payload)
-
-        playback = _RoomPlayback(
-            getattr(client, "role", "guest"),
-            send_callback=send_sync,
-            on_error=lambda exc: set_notice(self._playback_error_notice(exc)),
-        )
-
-        def queue_playback(
-            current_playback: Optional[Dict[str, Any]],
-            reference: Optional[Dict[str, Any]],
-        ) -> None:
-            nonlocal playback_task, busy, dirty
-            if not current_playback or not isinstance(reference, dict):
-                return
-            if playback_task is not None and not playback_task.done():
-                playback_task.cancel()
-            busy = "Resolving stream & launching MPV..."
-            playback_task = asyncio.create_task(
-                playback.start(current_playback, reference)
+            await runtime.start()
+        else:
+            runtime.configure(
+                initial_error=initial_error,
+                technical_error=technical_error,
+                notice=notice,
             )
-            dirty = True
-
-        def on_episode_changed(message: Any) -> None:
-            nonlocal selected_reference, selected_playback, playback_task, dirty
-            reference = self._reference_from_message(message)
-            if not reference:
-                return
-            selected_reference = reference
-            incoming_playback = self._playback_from_message(message)
-            if str(getattr(client, "role", "guest") or "guest").lower() != "host":
-                set_notice(f"Host picked: {self._selection_label(reference)}")
-                if incoming_playback:
-                    selected_playback = incoming_playback
-                    queue_playback(incoming_playback, reference)
-                else:
-                    selected_playback = None
-                    if playback_task is not None and not playback_task.done():
-                        playback_task.cancel()
-                    playback_task = None
-                    asyncio.create_task(playback.stop())
-            else:
-                dirty = True
-            if incoming_playback:
-                selected_playback = incoming_playback
-
-        def on_sync_playback(message: Any) -> None:
-            payload = (
-                message.get("payload")
-                if isinstance(message, dict)
-                else getattr(message, "payload", None)
-            )
-            if isinstance(payload, dict) and playback.active:
-                asyncio.create_task(playback.apply_sync(payload))
-
-        def on_room_state(message: Any) -> None:
-            # Relay rooms carry the current pick in room state; adopt it quietly
-            # so re-joining guests see what the host already chose.
-            nonlocal selected_reference, dirty
-            reference = self._reference_from_message(message)
-            if reference and reference != selected_reference:
-                selected_reference = reference
-                dirty = True
-
-        async def share_selection() -> bool:
-            nonlocal pending_share
-            reference = selected_reference
-            if (
-                reference is None
-                or not getattr(client, "channels_ready", False)
-                or not hasattr(client, "send_event")
-            ):
-                pending_share = True
-                return False
-            label = self._selection_label(reference)
-            payload: Dict[str, Any] = {"anime_reference": reference}
-            broadcast_playback = self._broadcast_playback(selected_playback)
-            if broadcast_playback:
-                payload["playback"] = broadcast_playback
-                payload["stream_url"] = broadcast_playback.get("url")
-                payload["title"] = (
-                    broadcast_playback.get("title") or reference.get("title")
-                )
-                payload["episode_number"] = (
-                    broadcast_playback.get("episode_number")
-                    or reference.get("episode_number")
-                )
-                if broadcast_playback.get("headers"):
-                    payload["headers"] = broadcast_playback["headers"]
-            try:
-                broadcaster = getattr(client, "broadcast_playback", None)
-                if broadcast_playback and callable(broadcaster):
-                    await broadcaster(broadcast_playback, reference)
-                else:
-                    await client.send_event(
-                        PartyEvent.EPISODE_CHANGED.value, payload
-                    )
-            except Exception as exc:
-                _, message, _ = self._friendly_error(exc, "room")
-                logger.warning("Watch Together selection broadcast failed: %s", message)
-                pending_share = True
-                set_notice(
-                    "Picked it. Will share when the connection returns."
-                    if self.console.width < 56
-                    else f"Picked {label}, but couldn't share it yet. "
-                    "It will be shared automatically when the room reconnects."
-                )
-                return False
-            pending_share = False
-            set_notice(
-                f"Shared: {label}"
-                if self.console.width < 56
-                else f"Room pick shared: {label}."
-            )
-            return True
-
-        if hasattr(client, "subscribe"):
-            for event, handler in (
-                (PartyEvent.EPISODE_CHANGED.value, on_episode_changed),
-                (PartyEvent.ROOM_STATE.value, on_room_state),
-                (PartyEvent.SYNC_PLAYBACK.value, on_sync_playback),
-            ):
-                try:
-                    client.subscribe(event, handler)
-                    subscriptions.append((event, handler))
-                except Exception:
-                    pass
-
-        # Realtime broadcast is best-effort; the persisted room state is the
-        # fallback when a frame is dropped or the channel write is rejected.
-        start_poll = getattr(client, "start_playback_poll", None)
-        if callable(start_poll):
-            try:
-                start_poll()
-            except Exception:
-                pass
-
         try:
-            with RawTerminal():
-                with Live(
-                    self._build_room_view(model(), show_diagnostics),
-                    console=self.console,
-                    screen=True,
-                    auto_refresh=False,
-                    refresh_per_second=6,
-                ) as live:
-                    if getattr(client, "room_active", False):
-                        state_task = asyncio.create_task(client.get_room_state())
-
-                    try:
-                        while True:
-                            now = time.monotonic()
-
-                            if notice and notice_until and now >= notice_until:
-                                notice = ""
-                                notice_until = 0.0
-                                dirty = True
-
-                            if state_task is not None and state_task.done():
-                                try:
-                                    state = state_task.result()
-                                    state_error = None
-                                    if notice.startswith(("Refreshing", "We couldn't refresh")):
-                                        set_notice("")
-                                except Exception as exc:
-                                    state_error = self._describe_error(exc)
-                                    if not notice:
-                                        set_notice(
-                                            "We couldn't refresh the member list. "
-                                            "Press [r] to try again."
-                                        )
-                                state_task = None
-                                next_refresh = now + _STATE_REFRESH_SECONDS
-                                dirty = True
-
-                            if (
-                                state_task is None
-                                and getattr(client, "channels_ready", False)
-                                and now >= next_refresh
-                            ):
-                                state_task = asyncio.create_task(client.get_room_state())
-                                next_refresh = now + _STATE_REFRESH_SECONDS
-
-                            if retry_task is not None and retry_task.done():
-                                try:
-                                    retry_task.result()
-                                except Exception:
-                                    pass
-                                retry_task = None
-                                next_retry = now + _RECONNECT_RETRY_SECONDS
-                                dirty = True
-
-                            if playback_task is not None and playback_task.done():
-                                try:
-                                    playback_task.result()
-                                except asyncio.CancelledError:
-                                    pass
-                                except Exception as exc:
-                                    set_notice(self._playback_error_notice(exc))
-                                playback_task = None
-                                busy = ""
-                                dirty = True
-
-                            ready_now = bool(getattr(client, "channels_ready", False))
-                            if (
-                                retry_task is None
-                                and not ready_now
-                                and not busy
-                                and getattr(client, "room_active", False)
-                                and now >= next_retry
-                            ):
-                                # Recover from dropped sockets in the background so
-                                # the room never blocks on a scary error screen.
-                                retry_task = asyncio.create_task(
-                                    client.retry_connection()
-                                )
-                                next_retry = now + _RECONNECT_RETRY_SECONDS
-
-                            if busy or not ready_now:
-                                spinner_frame = int(now * 9)
-
-                            if getattr(client, "channels_ready", False) and error:
-                                error = None
-                                technical = getattr(client, "channel_error", None) or technical
-                                if not notice:
-                                    set_notice("Connected again.")
-                                dirty = True
-
-                            if ready_now and not was_ready and pending_share:
-                                # Reconnected after a pick: deliver the queued selection.
-                                await share_selection()
-                            elif ready_now and not was_ready and not notice:
-                                set_notice("Connected again.")
-                            was_ready = ready_now
-
-                            current_status = (
-                                bool(getattr(client, "connected", False)),
-                                bool(getattr(client, "channels_ready", False)),
-                                getattr(client, "channel_error", None),
-                                busy,
-                                show_diagnostics,
-                                error,
-                                leave_error,
-                                notice,
-                                len((state or {}).get("participants") or []),
-                                selected_reference,
-                                spinner_frame,
-                            )
-                            if current_status != last_status:
-                                last_status = current_status
-                                dirty = True
-
-                            size = (self.console.width, self.console.height)
-                            if size != last_size:
-                                last_size = size
-                                dirty = True
-
-                            if dirty:
-                                live.update(
-                                    self._build_room_view(model(), show_diagnostics),
-                                    refresh=True,
-                                )
-                                dirty = False
-
-                            key = get_key()
-
-                            if key in ("l", "L", "q", "Q"):
-                                wants_quit = key in ("q", "Q")
-                                if playback_task is not None and not playback_task.done():
-                                    playback_task.cancel()
-                                    try:
-                                        await playback_task
-                                    except (asyncio.CancelledError, Exception):
-                                        pass
-                                playback_task = None
-                                busy = "Leaving the room..."
-                                await playback.stop()
-                                leave_task = asyncio.create_task(client.leave_room())
-                                frame = 0
-                                while not leave_task.done():
-                                    frame += 1
-                                    live.update(
-                                        self._build_room_view(
-                                            model(current_busy="Leaving the room..."),
-                                            show_diagnostics,
-                                        ),
-                                        refresh=True,
-                                    )
-                                    await asyncio.sleep(0.08)
-                                busy = ""
-                                try:
-                                    leave_task.result()
-                                except Exception as exc:
-                                    _, message, technical = self._friendly_error(exc, "leave")
-                                    leave_error = message
-                                    set_notice("")
-                                else:
-                                    left = True
-                                    quit_requested = wants_quit
-                                    break
-
-                            elif key in ("b", "B"):
-                                is_host = str(
-                                    getattr(client, "role", "guest") or "guest"
-                                ).lower() == "host"
-                                if not is_host:
-                                    set_notice(
-                                        "Only the host picks the episode."
-                                        if self.console.width < 56
-                                        else "Only the host can choose what the room watches."
-                                    )
-                                elif self._browse_callback is None:
-                                    set_notice(
-                                        "Anime browsing isn't available here. "
-                                        "Press [l] to leave."
-                                    )
-                                else:
-                                    # Hand the terminal back to the normal menus,
-                                    # then restore the same room without a blank frame.
-                                    live.stop()
-                                    selection = None
-                                    browse_failed = False
-                                    try:
-                                        selection = await asyncio.to_thread(
-                                            self._browse_callback, self._api
-                                        )
-                                    except (KeyboardInterrupt, SystemExit):
-                                        raise
-                                    except Exception:
-                                        logger.error(
-                                            "Watch Together browse failed",
-                                            exc_info=True,
-                                        )
-                                        browse_failed = True
-                                    finally:
-                                        live.start()
-                                        live.update(
-                                            self._build_room_view(
-                                                model(), show_diagnostics
-                                            ),
-                                            refresh=True,
-                                        )
-                                        dirty = False
-
-                                    narrow = self.console.width < 56
-                                    if browse_failed:
-                                        set_notice(
-                                            "Couldn't open the browser. Room is still open."
-                                            if narrow
-                                            else "We couldn't open the anime browser. "
-                                            "Your room is still open."
-                                        )
-                                    elif not selection:
-                                        set_notice(
-                                            "Back in the room."
-                                            if narrow
-                                            else "Back in the room. Your room is still open."
-                                        )
-                                    else:
-                                        reference = self._selection_reference(selection)
-                                        if reference is None:
-                                            set_notice(
-                                                "That anime had no episode. Room is still open."
-                                                if narrow
-                                                else "That anime didn't have a usable episode. "
-                                                "Your room is still open."
-                                            )
-                                        else:
-                                            selected_reference = reference
-                                            selected_playback = self._playback_from_selection(
-                                                selection
-                                            )
-                                            if not await share_selection():
-                                                pending_share = True
-                                                if narrow:
-                                                    set_notice(
-                                                        "Picked it. Will share when the connection returns."
-                                                    )
-                                            playback_error = selection.get(
-                                                "playback_error"
-                                            )
-                                            if selected_playback:
-                                                queue_playback(
-                                                    selected_playback, reference
-                                                )
-                                            elif playback_error:
-                                                set_notice(str(playback_error))
-
-                            elif key in ("r", "R"):
-                                if getattr(client, "channels_ready", False):
-                                    if state_task is None:
-                                        set_notice("Refreshing members...")
-                                        state_task = asyncio.create_task(client.get_room_state())
-                                        next_refresh = time.monotonic() + _STATE_REFRESH_SECONDS
-                                    else:
-                                        set_notice("Members are already refreshing.")
-                                elif retry_task is None:
-                                    next_retry = time.monotonic()
-                                    set_notice("Reconnecting...")
-                                else:
-                                    set_notice("Already reconnecting.")
-
-                            elif key in ("c", "C"):
-                                code = getattr(client, "room_code", None)
-                                if code:
-                                    if self._copy_to_clipboard(str(code)):
-                                        set_notice("Room code copied.")
-                                    else:
-                                        set_notice("Copy isn't available here. Share the code manually.")
-                                else:
-                                    set_notice("There is no room code to copy yet.")
-
-                            elif key in ("i", "I"):
-                                show_diagnostics = not show_diagnostics
-                                set_notice("")
-
-                            elif key == "ESC":
-                                if show_diagnostics:
-                                    show_diagnostics = False
-                                    dirty = True
-                                else:
-                                    guest_hint = (
-                                        "Press [l] to leave, [i] for details, "
-                                        "or [q] to quit."
-                                    )
-                                    host_hint = (
-                                        "Press [b] to browse, [l] to leave, "
-                                        "[i] for details, or [q] to quit."
-                                    )
-                                    set_notice(
-                                        host_hint
-                                        if str(
-                                            getattr(client, "role", "guest")
-                                        ).lower() == "host"
-                                        else guest_hint
-                                    )
-
-                            await asyncio.sleep(_STATUS_POLL_SECONDS)
-                    finally:
-                        for task in (state_task, retry_task, playback_task):
-                            if task is not None:
-                                task.cancel()
-                                try:
-                                    await task
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                        await playback.stop()
+            return await runtime.run_ui()
         finally:
-            stop_poll = getattr(client, "stop_playback_poll", None)
-            if callable(stop_poll):
-                try:
-                    stop_poll()
-                except Exception:
-                    pass
-            if hasattr(client, "unsubscribe"):
-                for event, handler in subscriptions:
-                    try:
-                        client.unsubscribe(event, handler)
-                    except Exception:
-                        pass
-
-        self._quit_requested = quit_requested
-        return left
+            if owns_runtime:
+                await runtime.stop()
 
     # ------------------------------------------------------------------
     # Room view model
@@ -1901,9 +2131,9 @@ class WatchTogetherUI:
     def _actions_text(
         self, model: Dict[str, Any], width: int, show_diagnostics: bool
     ) -> Text:
-        entries: List[Tuple[str, str, str]] = []
-        if model["is_host"]:
-            entries.append(("b", "Browse Anime", COLOR_ACCENT))
+        entries: List[Tuple[str, str, str]] = [
+            ("b", "Back to Main Menu", COLOR_ACCENT),
+        ]
         entries.append(("l", "Leave Room", COLOR_ERROR))
         entries.append((
             "i",
@@ -1914,7 +2144,7 @@ class WatchTogetherUI:
 
         if width < 30:
             short = {
-                "Browse Anime": "Browse",
+                "Back to Main Menu": "Menu",
                 "Leave Room": "Leave",
                 "Hide Details": "Hide",
             }

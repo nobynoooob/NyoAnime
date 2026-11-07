@@ -167,7 +167,7 @@ def test_host_room_panel_is_friendly_and_hides_diagnostics():
     assert "Share this code so friends can join" in output
     assert "HOST  Alice" in output
     assert "[Host]" in output
-    assert "[b] Browse Anime" in output
+    assert "[b] Back to Main Menu" in output
     assert "[l] Leave Room" in output
     assert "[i] Details" in output
     assert "[q] Quit" in output
@@ -201,7 +201,7 @@ def test_guest_room_panel_identifies_host_and_you():
     assert "Bob" in output
     assert "[Host]" in output
     assert "[Guest]" in output
-    assert "[b] Browse Anime" not in output
+    assert "[b] Back to Main Menu" in output
     assert "[l] Leave Room" in output
     assert "[i] Details" in output
     assert "[q] Quit" in output
@@ -488,6 +488,35 @@ def test_main_menu_advertises_watch_together():
     assert shortcuts == watch
 
 
+def test_active_room_shows_banner_and_return_shortcut():
+    ui = UIManager()
+    status = {
+        "room_code": "378854",
+        "role": "host",
+        "connected": True,
+        "channels_ready": True,
+    }
+    ui.room_status_provider = lambda: status
+
+    banner = ui._room_banner_text()
+    assert "Hosting Room: 378854" in banner.plain
+    assert "[v] Return to Room" in banner.plain
+
+    model = ui._home_navigation_model([], room_status=status)
+    assert model["app_nav"][0] == {
+        "key": "v",
+        "label": "return to room",
+        "action": "watchtogether",
+    }
+    assert model["grid_items"][0]["key"] == "v"
+
+    status["role"] = "guest"
+    assert "In Room: 378854" in ui._room_banner_text().plain
+
+    ui.room_status_provider = lambda: None
+    assert ui._room_banner_text() is None
+
+
 def test_main_menu_grid_keeps_exit_last_and_all_tiles():
     ui = UIManager()
     model = ui._home_navigation_model([])
@@ -624,13 +653,13 @@ def render_text(renderable):
     return console.file.getvalue()
 
 
-def test_room_panel_advertises_browse_without_hiding_leave():
+def test_room_panel_advertises_back_to_menu_without_hiding_leave():
     ui = WatchTogetherUI(make_console())
     client = FakeClient(role="host", channels_ready=True, nickname="Alice")
 
     output = render(ui, ui._build_room_panel(ui.room_view_model(client)))
 
-    assert "[b] Browse Anime" in output
+    assert "[b] Back to Main Menu" in output
     assert "[l] Leave Room" in output
 
 
@@ -641,220 +670,127 @@ def test_host_footer_matches_streamlined_controls():
     output = render(ui, ui._build_room_panel(ui.room_view_model(client)))
 
     assert (
-        "[b] Browse Anime • [l] Leave Room • [i] Details • [q] Quit"
+        "[b] Back to Main Menu • [l] Leave Room • [i] Details • [q] Quit"
         in output
     )
 
 
-def test_guest_footer_has_no_browse_control():
+def test_guest_footer_can_also_return_to_menu():
     ui = WatchTogetherUI(make_console())
     client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
 
     output = render(ui, ui._build_room_panel(ui.room_view_model(client)))
 
-    assert "[b] Browse Anime" not in output
-    assert "[l] Leave Room • [i] Details • [q] Quit" in output
+    assert "[b] Back to Main Menu" in output
+    assert "[b] Back to Main Menu • [l] Leave Room • [i] Details • [q] Quit" in output
 
 
 @pytest.mark.asyncio
-async def test_browse_keeps_room_identity_and_returns_to_it(monkeypatch):
+async def test_back_to_menu_keeps_room_runtime_alive(monkeypatch):
     import nyoanime.ui_watchtogether as ww
 
     RecordingLive.instances.clear()
     client = FakeClient(role="host", channels_ready=True, nickname="Alice")
-    observed = {}
-
-    def browse(api):
-        observed.update({
-            "api": api,
-            "room_code": client.room_code,
-            "room_id": client.room_id,
-            "participant_id": client.participant_id,
-            "leave_calls": client.leave_calls,
-            "close_calls": client.close_calls,
-            "connected": client.connected,
-        })
-        return None
-
-    marker = object()
-    ui = WatchTogetherUI(make_console(), browse_callback=browse)
-    ui._api = marker
-    keys = iter(["b", "l"])
-    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
-    monkeypatch.setattr(ww, "Live", RecordingLive)
-    monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
-
-    assert await ui._room_screen(client) is True
-
-    assert observed["api"] is marker
-    assert observed["room_code"] == "123456"
-    assert observed["room_id"] == ROOM_ID
-    assert observed["participant_id"] == PARTICIPANT_ID
-    assert observed["leave_calls"] == 0
-    assert observed["close_calls"] == 0
-    assert observed["connected"] is True
-    assert client.leave_calls == 1
-    live = RecordingLive.instances[0]
-    assert live.stopped == 1
-    assert live.started == 1
-    assert any("Back in the room" in render_text(row) for row in live.renders)
-    assert "episode_changed" in client.subscriptions
-    assert "room_state" in client.subscriptions
-    assert client.unsubscribed
-
-
-@pytest.mark.asyncio
-async def test_host_browse_broadcasts_selection_without_recreating_room(monkeypatch):
-    import nyoanime.ui_watchtogether as ww
-
-    RecordingLive.instances.clear()
-    client = FakeClient(role="host", channels_ready=True, nickname="Alice")
-    selection = {
-        "anime": {
-            "id": "frieren",
-            "title_en": "Frieren: Beyond Journey's End",
-            "thumbnail": "https://example.test/frieren.jpg",
-            "type": "TV",
-        },
-        "episode": {"display_num": 3, "title": "Killing Magic"},
-        "provider_id": "hianime",
-        "language_mode": "en_sub",
-    }
-    ui = WatchTogetherUI(make_console(), browse_callback=lambda api: selection)
-    keys = iter(["b", "l"])
-    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
-    monkeypatch.setattr(ww, "Live", RecordingLive)
-    monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
-
-    assert await ui._room_screen(client) is True
-
-    assert len(client.events) == 1
-    event, payload = client.events[0]
-    assert event == "episode_changed"
-    reference = payload["anime_reference"]
-    assert reference["title"] == "Frieren: Beyond Journey's End"
-    assert reference["anime_id"] == "frieren"
-    assert reference["episode_number"] == "3"
-    assert reference["episode_title"] == "Killing Magic"
-    assert reference["provider_id"] == "hianime"
-    assert reference["poster"] == "https://example.test/frieren.jpg"
-    assert client.leave_calls == 1
-    assert client.close_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_guest_receives_and_displays_host_selection(monkeypatch):
-    import nyoanime.ui_watchtogether as ww
-
-    RecordingLive.instances.clear()
-    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
-    dispatched = {"done": False}
-
-    def key():
-        if not dispatched["done"]:
-            dispatched["done"] = True
-            client.deliver(
-                "episode_changed",
-                {
-                    "payload": {
-                        "anime_reference": {
-                            "title": "Frieren",
-                            "episode_number": "4",
-                            "episode_title": "The Journey's End",
-                        }
-                    }
-                },
-            )
-        return "l"
-
     ui = WatchTogetherUI(make_console())
-    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
-    monkeypatch.setattr(ww, "Live", RecordingLive)
-    monkeypatch.setattr(ww, "get_key", key)
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
 
-    assert await ui._room_screen(client) is True
-
-    live = RecordingLive.instances[0]
-    outputs = "\n".join(render_text(row) for row in live.renders)
-    assert "Frieren" in outputs
-    assert "Episode 4" in outputs
-    assert "Chosen by the host." in outputs
-    assert client.leave_calls == 1
-    assert client.poll_started == 1
-    assert client.poll_stopped == 1
-
-
-@pytest.mark.asyncio
-async def test_guest_browse_does_not_hijack_the_room(monkeypatch):
-    import nyoanime.ui_watchtogether as ww
-
-    RecordingLive.instances.clear()
-    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
-    ui = WatchTogetherUI(
-        make_console(),
-        browse_callback=lambda api: {"title": "Not Mine", "episode_number": "1"},
-    )
-    keys = iter(["b", "l"])
+    keys = iter(["b"])
     monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
     monkeypatch.setattr(ww, "Live", RecordingLive)
     monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
 
-    assert await ui._room_screen(client) is True
+    assert await ui._room_screen(client, runtime=runtime) is False
+    assert client.leave_calls == 0
+    assert client.close_calls == 0
+    assert client.poll_stopped == 0
+    assert "episode_changed" in client.subscriptions
 
-    assert client.events == []
-    outputs = "\n".join(
-        render_text(row) for row in RecordingLive.instances[0].renders
-    )
-    assert "Only the host can choose what the room watches." in outputs
+    # Leaving the screen must not tear down the listener; only shutdown does.
+    await runtime.stop()
+    assert client.poll_stopped == 1
+    assert "episode_changed" in client.unsubscribed
 
 
-def test_selection_reference_accepts_direct_reference():
-    reference = WatchTogetherUI._selection_reference(
-        {"anime_reference": {"title": "Frieren", "episode_number": "2"}}
-    )
+def test_session_survives_back_and_leave_tears_it_down(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
 
-    assert reference == {"title": "Frieren", "episode_number": "2"}
+    class ConnectableClient(FakeClient):
+        async def connect(self, room_code=None, token=None):
+            self.connected = True
+
+        async def create_room(self, language_mode="ar_sub", timeout=10.0):
+            self.role = "host"
+            self.room_active = True
+            return self.room_code
+
+    RecordingLive.instances.clear()
+    client = ConnectableClient(role="host", channels_ready=True, nickname="Alice")
+    ui = WatchTogetherUI(make_console())
+    ui._client_factory = lambda nickname: client
+
+    async def run_steps(steps):
+        for _, step in steps:
+            await step()
+
+    ui._run_steps = run_steps
+    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
+    monkeypatch.setattr(ww, "Live", RecordingLive)
+
+    session = ww.WatchTogetherSession(ui, None)
+    try:
+        assert session.connect() is None
+        assert session.active
+        ui._session = session
+
+        keys = iter(["b"])
+        monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
+        ui._open_room()
+
+        assert ui._session is session
+        assert session.active
+        assert client.leave_calls == 0
+        assert client.poll_started == 1
+        assert client.poll_stopped == 0
+
+        keys = iter(["l"])
+        monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
+        ui._open_room()
+
+        assert ui._session is None
+        assert client.leave_calls == 1
+        assert client.close_calls == 1
+        assert client.poll_stopped == 1
+        assert not session._thread.is_alive()
+    finally:
+        session.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_offline_host_pick_is_shared_after_reconnect(monkeypatch):
+async def test_offline_host_pick_is_shared_after_reconnect():
     import nyoanime.ui_watchtogether as ww
 
-    RecordingLive.instances.clear()
     client = FakeClient(role="host", channels_ready=False, nickname="Alice")
-    ui = WatchTogetherUI(
-        make_console(),
-        browse_callback=lambda api: {"title": "Frieren", "episode_number": "5"},
-    )
-    calls = {"keys": 0}
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
 
-    def key():
-        calls["keys"] += 1
-        if calls["keys"] == 1:
-            return "b"
-        if calls["keys"] == 2:
-            client.channels_ready = True
-            client.channel_status = {"room": True}
-            return None
-        return "l"
+    runtime.selected_reference = {"title": "Frieren", "episode_number": "5"}
+    assert await runtime.share_selection() is False
+    assert runtime.pending_share is True
+    assert client.events == []
 
-    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
-    monkeypatch.setattr(ww, "Live", RecordingLive)
-    monkeypatch.setattr(ww, "get_key", key)
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
-
-    assert await ui._room_screen(client) is True
+    client.channels_ready = True
+    client.channel_status = {"room": True}
+    runtime.was_ready = False
+    await runtime._tick()
 
     assert len(client.events) == 1
     event, payload = client.events[0]
     assert event == "episode_changed"
     assert payload["anime_reference"]["episode_number"] == "5"
-    assert client.leave_calls == 1
-    assert client.close_calls == 0
+    assert runtime.pending_share is False
+    await runtime.stop()
 
 
 def test_app_browse_reuses_existing_anime_and_episode_menus(monkeypatch):
@@ -1003,12 +939,11 @@ def _playback_payload(url="https://cdn.example.test/episode.m3u8"):
 
 
 @pytest.mark.asyncio
-async def test_host_selection_launches_mpv_and_broadcasts_stream(monkeypatch):
+async def test_host_play_from_menu_broadcasts_and_starts_room_mpv(monkeypatch):
     import nyoanime.ui_watchtogether as ww
 
     _FakeMPV.instances.clear()
     _FakeSync.instances.clear()
-    RecordingLive.instances.clear()
     monkeypatch.setattr(ww, "MPVController", _FakeMPV)
     monkeypatch.setattr(ww, "SyncEngine", _FakeSync)
 
@@ -1020,23 +955,14 @@ async def test_host_selection_launches_mpv_and_broadcasts_stream(monkeypatch):
         "language_mode": "en_sub",
         "playback": _playback_payload(),
     }
-    ui = WatchTogetherUI(make_console(), browse_callback=lambda api: selection)
-    calls = {"n": 0}
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
 
-    def key():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return "b"
-        if calls["n"] < 8:
-            return None
-        return "l"
-
-    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
-    monkeypatch.setattr(ww, "Live", RecordingLive)
-    monkeypatch.setattr(ww, "get_key", key)
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
-
-    assert await ui._room_screen(client) is True
+    playback = ui._playback_from_selection(selection)
+    reference = ui._selection_reference(selection)
+    await runtime.play_episode(playback, reference)
+    await asyncio.sleep(0)
 
     assert len(client.events) == 1
     event, payload = client.events[0]
@@ -1062,6 +988,7 @@ async def test_host_selection_launches_mpv_and_broadcasts_stream(monkeypatch):
     assert len(_FakeSync.instances) == 1
     assert _FakeSync.instances[0].role == "host"
     assert _FakeSync.instances[0].host_started == 1
+    await runtime.stop()
 
 
 @pytest.mark.asyncio
@@ -1139,7 +1066,6 @@ async def test_mpv_launch_failure_becomes_a_notice(monkeypatch):
 
     _FakeMPV.instances.clear()
     _FakeSync.instances.clear()
-    RecordingLive.instances.clear()
     monkeypatch.setattr(ww, "MPVController", BrokenMPV)
     monkeypatch.setattr(ww, "SyncEngine", _FakeSync)
 
@@ -1150,28 +1076,20 @@ async def test_mpv_launch_failure_becomes_a_notice(monkeypatch):
         "provider_id": "hianime",
         "playback": _playback_payload(),
     }
-    ui = WatchTogetherUI(make_console(), browse_callback=lambda api: selection)
-    calls = {"n": 0}
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
 
-    def key():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return "b"
-        if calls["n"] < 8:
-            return None
-        return "l"
-
-    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
-    monkeypatch.setattr(ww, "Live", RecordingLive)
-    monkeypatch.setattr(ww, "get_key", key)
-    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
-
-    assert await ui._room_screen(client) is True
-
-    outputs = "\n".join(
-        render_text(row) for row in RecordingLive.instances[0].renders
+    await runtime.play_episode(
+        ui._playback_from_selection(selection),
+        ui._selection_reference(selection),
     )
-    assert "MPV isn't installed" in outputs
+    await asyncio.sleep(0)
+    await runtime._tick()
+
+    assert "MPV isn't installed" in runtime.notice
+    assert "MPV isn't installed" in render_text(runtime._view())
+    await runtime.stop()
 
 
 def test_app_browse_resolves_a_direct_stream_for_watch_together(monkeypatch):
