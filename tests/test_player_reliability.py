@@ -43,6 +43,15 @@ def _run_mpv(monkeypatch, **kwargs):
 
 
 class TestMpvArguments:
+    def test_seeking_uses_bounded_cache_and_seekable_demuxer(self, monkeypatch):
+        args, _ = _run_mpv(monkeypatch)
+
+        assert "--cache=yes" in args
+        assert "--demuxer-max-bytes=150M" in args
+        assert "--demuxer-readahead-secs=20" in args
+        assert "--demuxer-seekable-cache=yes" in args
+        assert "--hr-seek=yes" in args
+
     def test_subtitle_off_disables_all_subtitle_sources(self, monkeypatch):
         args, result = _run_mpv(
             monkeypatch,

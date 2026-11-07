@@ -50,7 +50,7 @@ from .party.mpv_controller import MPVController
 from .party.protocol import PartyEvent, sanitize_diagnostic
 from .party.supabase_config import SupabaseConfigError
 from .party.sync import SyncEngine, SyncState
-from .utils import RawTerminal, get_key
+from .utils import RawTerminal, flush_stdin, get_key
 
 logger = logging.getLogger(__name__)
 
@@ -591,6 +591,9 @@ class _RoomRuntime:
         self._dirty = True
         self.left = False
         self.quit_requested = False
+        # Drop mouse/arrow bursts queued while menus were moving so they are
+        # not replayed as room commands.
+        flush_stdin()
         last_status = None
         last_size = (self.owner.console.width, self.owner.console.height)
         try:

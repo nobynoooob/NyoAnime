@@ -54,7 +54,9 @@ class MpvTracker:
                     if os.path.exists(self.sock_path):
                         import socket
                         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                        s.settimeout(0.5)
+                        # Short read timeout keeps stop() responsive while MPV
+                        # is busy seeking/rebuffering.
+                        s.settimeout(0.15)
                         s.connect(self.sock_path)
                         break
             except Exception:
@@ -718,11 +720,12 @@ class PlayerManager:
             'position_reported': False,
         }
 
-    def _play_mpv(
-        self,
+    @staticmethod
+    def _build_mpv_args(
+        mpv_path: str,
         url: str,
         title: str,
-        mpv_path: str = None,
+        ipc_sock_path: str,
         start_time: float = 0.0,
         audio_lang: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -731,45 +734,28 @@ class PlayerManager:
         audio_url: Optional[str] = None,
         subtitles_disabled: bool = False,
         hls_bitrate: Optional[int] = None,
-    ) -> dict:
-        if not mpv_path:
-            mpv_path = self.get_available_players().get('MPV')
-        
-        if not mpv_path or (mpv_path != 'mpv' and not os.path.exists(mpv_path)):
-            raise FileNotFoundError(f"MPV not found at: {mpv_path}")
-
-        # Determine dynamic referer per provider
+    ) -> list:
+        """Shared MPV argv for solo playback and Watch Together rooms."""
         referer = get_stream_referer(url)
-
-        # Setup IPC Socket
-        is_win = (os.name == 'nt')
-        ipc_id = f"ani_mpv_{os.getpid()}_{int(time.time()*1000)}"
-        if is_win:
-            sock_path = f"\\\\.\\pipe\\{ipc_id}"
-        else:
-            sock_path = os.path.join(tempfile.gettempdir(), f"{ipc_id}.sock")
-            if os.path.exists(sock_path):
-                try:
-                    os.remove(sock_path)
-                except Exception:
-                    pass
-
-        # High-performance stream caching & hardware decoding for MPV
-        mpv_args = [
+        args = [
             mpv_path,
             '--fullscreen',
             '--force-window=yes',
             '--keep-open=yes',
             '--ontop',
+            # 20s of readahead is enough to hide network jitter without
+            # making the demuxer chew through the whole episode on a seek.
             '--cache=yes',
-            '--demuxer-max-bytes=300MiB',
-            '--demuxer-max-back-bytes=100MiB',
-            '--demuxer-readahead-secs=600',
-            '--cache-secs=600',
+            '--cache-on-disk=no',
+            '--demuxer-max-bytes=150M',
+            '--demuxer-max-back-bytes=50M',
+            '--demuxer-readahead-secs=20',
+            '--cache-secs=60',
             '--cache-pause=yes',
             '--cache-pause-wait=3',
             '--cache-pause-initial=no',
-            f'--input-ipc-server={sock_path}',
+            '--demuxer-seekable-cache=yes',
+            f'--input-ipc-server={ipc_sock_path}',
             '--hr-seek=yes',
             '--hr-seek-framedrop=yes',
             '--stream-buffer-size=16MiB',
@@ -786,34 +772,31 @@ class PlayerManager:
             '--msg-level=all=no',
             f'--force-media-title={title}',
         ]
-        
-        if start_time and start_time > 0:
-            mpv_args.append(f'--start={start_time}')
-        else:
-            mpv_args.append('--start=0')
+
+        args.append(f'--start={start_time}' if start_time and start_time > 0 else '--start=0')
 
         # Arabic-first for dubbed Stardima titles; keep the existing Japanese
         # default for providers that do not set an audio preference.
-        mpv_args.append(f'--alang={audio_lang or "jpn,ja,eng,en"}')
+        args.append(f'--alang={audio_lang or "jpn,ja,eng,en"}')
         if hls_bitrate and hls_bitrate > 0:
             # Pin the variant the user picked when playing a master playlist
             # (required for in-stream audio rendition selection).
-            mpv_args.append(f'--hls-bitrate={int(hls_bitrate)}')
+            args.append(f'--hls-bitrate={int(hls_bitrate)}')
         if subtitles_disabled:
-            mpv_args.append('--sid=no')
-            mpv_args.append('--sub-auto=no')
+            args.append('--sid=no')
+            args.append('--sub-auto=no')
         elif subtitle_url:
-            mpv_args.append(f'--sub-file={subtitle_url}')
+            args.append(f'--sub-file={subtitle_url}')
             if subtitle_lang:
-                mpv_args.append(f'--slang={subtitle_lang},eng,en')
+                args.append(f'--slang={subtitle_lang},eng,en')
         else:
             # Arabic-first providers keep their previous subtitle preference.
             default_slang = "ara,ar,eng,en" if (audio_lang or "").lower().startswith("ara") else "eng,en,ara,ar"
-            mpv_args.append(f'--slang={subtitle_lang or default_slang}')
+            args.append(f'--slang={subtitle_lang or default_slang}')
         # Only a separate external audio track belongs in --audio-file; HLS
         # renditions are selected in-stream through --alang.
         if audio_url:
-            mpv_args.append(f'--audio-file={audio_url}')
+            args.append(f'--audio-file={audio_url}')
 
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
         ref = referer
@@ -830,17 +813,75 @@ class PlayerManager:
                 extra_headers.append(f"{header_name}: {header_value}")
 
         if ua:
-            mpv_args.append(f'--user-agent={ua}')
+            args.append(f'--user-agent={ua}')
         if ref:
-            mpv_args.append(f'--referrer={ref}')
+            args.append(f'--referrer={ref}')
         for header_field in extra_headers:
-            mpv_args.append(f'--http-header-fields={header_field}')
+            args.append(f'--http-header-fields={header_field}')
 
-        mpv_args.append(url)
+        args.append(url)
+        return args
 
-        from .utils import restore_terminal_for_input, enter_raw_mode_after_input, show_cursor, hide_cursor
+    def _play_mpv(
+        self,
+        url: str,
+        title: str,
+        mpv_path: str = None,
+        start_time: float = 0.0,
+        audio_lang: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        subtitle_url: Optional[str] = None,
+        subtitle_lang: Optional[str] = None,
+        audio_url: Optional[str] = None,
+        subtitles_disabled: bool = False,
+        hls_bitrate: Optional[int] = None,
+    ) -> dict:
+        if not mpv_path:
+            mpv_path = self.get_available_players().get('MPV')
+
+        if not mpv_path or (mpv_path != 'mpv' and not os.path.exists(mpv_path)):
+            raise FileNotFoundError(f"MPV not found at: {mpv_path}")
+
+        # Setup IPC Socket
+        is_win = (os.name == 'nt')
+        ipc_id = f"ani_mpv_{os.getpid()}_{int(time.time()*1000)}"
+        if is_win:
+            sock_path = f"\\\\.\\pipe\\{ipc_id}"
+        else:
+            sock_path = os.path.join(tempfile.gettempdir(), f"{ipc_id}.sock")
+            if os.path.exists(sock_path):
+                try:
+                    os.remove(sock_path)
+                except Exception:
+                    pass
+
+        mpv_args = self._build_mpv_args(
+            mpv_path,
+            url,
+            title,
+            sock_path,
+            start_time=start_time,
+            audio_lang=audio_lang,
+            headers=headers,
+            subtitle_url=subtitle_url,
+            subtitle_lang=subtitle_lang,
+            audio_url=audio_url,
+            subtitles_disabled=subtitles_disabled,
+            hls_bitrate=hls_bitrate,
+        )
+
+        from .utils import (
+            restore_terminal_for_input,
+            enter_raw_mode_after_input,
+            flush_stdin,
+            show_cursor,
+            hide_cursor,
+        )
         restore_terminal_for_input()
         show_cursor()
+        # Drop mouse/arrow bursts queued while MPV was focused so the menu
+        # does not replay them as navigation once playback ends.
+        flush_stdin()
 
         tracker = MpvTracker(sock_path)
         tracker.start()
@@ -860,6 +901,7 @@ class PlayerManager:
             logger.error("MPV", f"Player error output: {result.stderr.strip()}")
         
         tracker.stop()
+        flush_stdin()
         enter_raw_mode_after_input()
         hide_cursor()
 
@@ -908,9 +950,6 @@ class PlayerManager:
         if mpv_path != 'mpv' and not os.path.exists(mpv_path):
             raise FileNotFoundError(f"MPV not found at: {mpv_path}")
 
-        # Determine dynamic referer per provider
-        referer = get_stream_referer(url)
-
         # Setup IPC Socket
         is_win = (os.name == 'nt')
         ipc_id = f"ani_mpv_watch_{os.getpid()}_{int(time.time()*1000)}"
@@ -924,78 +963,22 @@ class PlayerManager:
                 except Exception:
                     pass
 
-        # Build MPV arguments (same as _play_mpv but with quiet mode)
-        mpv_args = [
+        mpv_args = self._build_mpv_args(
             mpv_path,
-            '--fullscreen',
-            '--force-window=yes',
-            '--keep-open=yes',
-            '--ontop',
-            '--cache=yes',
-            '--demuxer-max-bytes=300MiB',
-            '--demuxer-max-back-bytes=100MiB',
-            '--demuxer-readahead-secs=600',
-            '--cache-secs=600',
-            '--cache-pause=yes',
-            '--cache-pause-wait=3',
-            '--cache-pause-initial=no',
-            f'--input-ipc-server={sock_path}',
-            '--hr-seek=yes',
-            '--hr-seek-framedrop=yes',
-            '--stream-buffer-size=16MiB',
-            '--network-timeout=15',
-            '--tls-verify=no',
-            '--hwdec=auto-safe',
-            '--vo=gpu',
-            '--profile=fast',
-            '--sub-auto=no',
-            '--really-quiet',
-            '--terminal=no',
-            '--msg-level=all=no',
-            f'--force-media-title={title}',
-        ]
-        if start_time and start_time > 0:
-            mpv_args.append(f'--start={start_time}')
-        else:
-            mpv_args.append('--start=0')
+            url,
+            title,
+            sock_path,
+            start_time=start_time,
+            audio_lang=audio_lang,
+            headers=headers,
+            subtitle_url=subtitle_url,
+            subtitle_lang=subtitle_lang,
+            audio_url=audio_url,
+            subtitles_disabled=subtitles_disabled,
+            hls_bitrate=hls_bitrate,
+        )
 
-        mpv_args.append(f'--alang={audio_lang or "jpn,ja,eng,en"}')
-        if hls_bitrate and hls_bitrate > 0:
-            mpv_args.append(f'--hls-bitrate={int(hls_bitrate)}')
-        if subtitles_disabled:
-            mpv_args.append('--sid=no')
-            mpv_args.append('--sub-auto=no')
-        elif subtitle_url:
-            mpv_args.append(f'--sub-file={subtitle_url}')
-            if subtitle_lang:
-                mpv_args.append(f'--slang={subtitle_lang},eng,en')
-        else:
-            default_slang = "ara,ar,eng,en" if (audio_lang or "").lower().startswith("ara") else "eng,en,ara,ar"
-            mpv_args.append(f'--slang={subtitle_lang or default_slang}')
-        if audio_url:
-            mpv_args.append(f'--audio-file={audio_url}')
-
-        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
-        ref = referer
-        extra_headers = []
-        for header_name, header_value in (headers or {}).items():
-            if not header_value:
-                continue
-            lower_k = str(header_name).strip().lower()
-            if lower_k == 'user-agent':
-                ua = str(header_value).strip()
-            elif lower_k == 'referer':
-                ref = str(header_value).strip()
-            else:
-                extra_headers.append(f"{header_name}: {header_value}")
-        if ua:
-            mpv_args.append(f'--user-agent={ua}')
-        if ref:
-            mpv_args.append(f'--referrer={ref}')
-        for header_field in extra_headers:
-            mpv_args.append(f'--http-header-fields={header_field}')
-
-        mpv_args.append(url)
+        from .utils import flush_stdin
 
         # Create tracker and start monitoring
         tracker = MpvTracker(sock_path)
@@ -1009,6 +992,8 @@ class PlayerManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        # Clear queued mouse escapes so the room UI does not act on stale input.
+        flush_stdin()
         duration = time.time() - t_start
         logger.log_player("MPV", mpv_args, exit_code=process.returncode, duration=duration)
         if process.returncode is not None and process.returncode != 0:
@@ -1024,59 +1009,100 @@ class PlayerManager:
         }
 
     @staticmethod
-    def send_mpv_command(sock_path: str, command: list, request_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """Send a JSON command to an MPV IPC socket.
-        Returns the parsed response if request_id is provided, otherwise None.
+    def send_mpv_command(
+        sock_path: str,
+        command: list,
+        request_id: Optional[int] = None,
+        timeout: float = 1.5,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a JSON command to MPV, never blocking longer than ``timeout``.
+
+        Seeks are fire-and-forget: MPV may be busy demuxing and unable to reply
+        immediately, so a slow/unresponsive player degrades to ``None`` instead
+        of stalling the UI thread (or an asyncio worker) for seconds.
         """
-        is_win = (os.name == 'nt')
-        if is_win:
-            # Windows named pipe: open in r+b mode
-            try:
-                f = open(sock_path, 'r+b', buffering=0)
-            except Exception as e:
-                raise RuntimeError(f"Cannot open MPV pipe {sock_path}: {e}")
-            # Write command line
-            raw = (json.dumps({"command": command, "request_id": request_id}) + "\n").encode('utf-8')
-            f.write(raw)
-            f.flush()
-            # Read response line
-            line_bytes = b""
-            chunk = f.read(4096)
-            if chunk:
-                line_bytes = chunk
-            f.close()
-            if line_bytes:
-                try:
-                    return json.loads(line_bytes.decode('utf-8'))
-                except Exception:
+        timeout = max(0.2, float(timeout))
+        raw = (json.dumps({"command": command, "request_id": request_id}) + "\n").encode('utf-8')
+        if os.name == 'nt':
+            return PlayerManager._send_mpv_command_windows(
+                sock_path, raw, request_id is not None, timeout
+            )
+        return PlayerManager._send_mpv_command_unix(
+            sock_path, raw, command, request_id is not None, timeout
+        )
+
+    @staticmethod
+    def _send_mpv_command_unix(
+        sock_path: str,
+        raw: bytes,
+        command: list,
+        wants_reply: bool,
+        timeout: float,
+    ) -> Optional[Dict[str, Any]]:
+        deadline = time.monotonic() + timeout
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect(sock_path)
+                s.sendall(raw)
+                if not wants_reply:
                     return None
+
+                data = b""
+                while time.monotonic() < deadline and b"\n" not in data:
+                    s.settimeout(max(0.05, deadline - time.monotonic()))
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                if data:
+                    try:
+                        return json.loads(data.decode('utf-8'))
+                    except Exception:
+                        return None
+                return None
+        except (socket.timeout, TimeoutError):
+            logger.debug("MPV", f"IPC command timed out after {timeout:.1f}s: {command}")
             return None
-        else:
-            # Unix domain socket
+        except Exception as e:
+            raise RuntimeError(f"MPV IPC error: {e}")
+
+    @staticmethod
+    def _send_mpv_command_windows(
+        sock_path: str,
+        raw: bytes,
+        wants_reply: bool,
+        timeout: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Named pipes have no read timeout; bound them with a worker thread."""
+        outcome: Dict[str, Any] = {}
+
+        def worker() -> None:
             try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                    s.settimeout(5.0)
-                    s.connect(sock_path)
-                    raw = (json.dumps({"command": command, "request_id": request_id}) + "\n").encode('utf-8')
-                    s.sendall(raw)
-                    if request_id is not None:
-                        # Attempt to read a response
-                        data = b""
-                        while True:
-                            chunk = s.recv(4096)
-                            if not chunk:
-                                break
-                            data += chunk
-                            if b"\n" in data:
-                                break
-                        if data:
-                            try:
-                                return json.loads(data.decode('utf-8'))
-                            except Exception:
-                                return None
-                    return None
-            except Exception as e:
-                raise RuntimeError(f"MPV IPC error: {e}")
+                with open(sock_path, 'r+b', buffering=0) as f:
+                    f.write(raw)
+                    f.flush()
+                    if wants_reply:
+                        outcome["reply"] = f.read(4096)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            logger.debug("MPV", f"Windows IPC command timed out after {timeout:.1f}s")
+            return None
+        error = outcome.get("error")
+        if error is not None:
+            raise RuntimeError(f"Cannot reach MPV pipe {sock_path}: {error}")
+        reply = outcome.get("reply")
+        if reply:
+            try:
+                return json.loads(reply.decode('utf-8'))
+            except Exception:
+                return None
+        return None
 
     def _play_mpc(self, url: str, title: str, mpc_path: str = None):
         if not mpc_path:
