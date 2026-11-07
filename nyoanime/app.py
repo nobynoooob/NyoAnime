@@ -97,6 +97,7 @@ class NyoAnimeApp:
         self.force_cli = False
         self._cleaned_up = False
         self._watch_together_ui = None
+        self._initial_join_code = None
 
     def _sync_active_provider(self):
         """Re-resolve the provider from language settings and refresh both handles."""
@@ -156,6 +157,11 @@ class NyoAnimeApp:
                 "Prompts once; the key is entered with hidden input."
             ),
         )
+        parser.add_argument(
+            '--join-room',
+            metavar='CODE',
+            help="Join a Watch Together room immediately, skipping the menus.",
+        )
         parser.add_argument('query', nargs='*', help="Anime name to search for")
         
         args = parser.parse_args()
@@ -167,6 +173,8 @@ class NyoAnimeApp:
                 session_dir=args.session_dir,
                 session_path=args.session_path,
             )
+
+        self._initial_join_code = (args.join_room or "").strip() or None
 
         if args.setup_supabase:
             from .party.local_config import run_supabase_setup
@@ -253,7 +261,7 @@ class NyoAnimeApp:
         while True:
             is_narrow = shutil.get_terminal_size().columns < 64
             
-            if self.force_cli or is_narrow:
+            if (self.force_cli or is_narrow) and not self._initial_join_code:
                 self.current_mode = "cli"
                 result = self.run_cli_mode(query)
                 query = None # Clear query after first run
@@ -285,13 +293,20 @@ class NyoAnimeApp:
         query_override = initial_query
         
         while True:
-            if '-i' not in sys.argv and shutil.get_terminal_size().columns < 64:
+            if (
+                '-i' not in sys.argv
+                and not self._initial_join_code
+                and shutil.get_terminal_size().columns < 64
+            ):
                 return "SWITCH_TO_CLI"
 
             # Always synchronize active provider directly from settings before home screen/actions
             self._sync_active_provider()
 
-            if query_override:
+            pending_join, self._initial_join_code = self._initial_join_code, None
+            if pending_join:
+                action, payload = "watchtogether", pending_join
+            elif query_override:
                 action, payload = "search", query_override
                 query_override = None
             else:
@@ -419,10 +434,13 @@ class NyoAnimeApp:
                 continue
 
             elif action == "watchtogether":
+                join_code = payload if isinstance(payload, str) and payload else None
                 try:
                     # One persistent owner: [b] returns here without dropping
                     # the room, and [v] jumps back into it.
-                    self._watch_together().handle_watch_together(self.api)
+                    self._watch_together().handle_watch_together(
+                        self.api, join_code=join_code
+                    )
                 except KeyboardInterrupt:
                     continue
                 except Exception:

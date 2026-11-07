@@ -766,6 +766,53 @@ def test_session_survives_back_and_leave_tears_it_down(monkeypatch):
         session.shutdown()
 
 
+def test_join_code_skips_the_host_join_menu(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+
+    class JoinableClient(FakeClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.join_calls = []
+
+        async def connect(self, room_code=None, token=None):
+            self.connected = True
+
+        async def join_room(self, code):
+            self.join_calls.append(code)
+            self.room_code = code
+            self.room_active = True
+            return {"room": {"code": code}}
+
+    RecordingLive.instances.clear()
+    client = JoinableClient(role="guest", channels_ready=True, nickname="Bob")
+    ui = WatchTogetherUI(make_console())
+    ui._client_factory = lambda nickname: client
+
+    async def run_steps(steps):
+        for _, step in steps:
+            await step()
+
+    ui._run_steps = run_steps
+    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
+    monkeypatch.setattr(ww, "Live", RecordingLive)
+    monkeypatch.setattr(
+        ui, "watch_together_menu", lambda **kwargs: pytest.fail("menu was shown")
+    )
+    keys = iter(["b"])
+    monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
+
+    try:
+        ui.handle_watch_together(None, join_code="378854")
+
+        assert client.join_calls == ["378854"]
+        status = ui.room_status()
+        assert status is not None
+        assert status["room_code"] == "378854"
+        assert status["role"] == "guest"
+    finally:
+        ui.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_offline_host_pick_is_shared_after_reconnect():
     import nyoanime.ui_watchtogether as ww

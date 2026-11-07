@@ -913,7 +913,7 @@ class WatchTogetherUI:
     # ------------------------------------------------------------------
     # Session entry point
     # ------------------------------------------------------------------
-    def handle_watch_together(self, api) -> None:
+    def handle_watch_together(self, api, join_code: Optional[str] = None) -> None:
         """Open the room, or launch the host/join flow if there isn't one."""
         self._api = api
         self._quit_requested = False
@@ -927,18 +927,23 @@ class WatchTogetherUI:
                 self._session = None
                 existing.shutdown()
 
+        pending_code = (join_code or "").strip() or None
         notice = ""
         while True:
-            choice = self.watch_together_menu(notice=notice)
-            notice = ""
-            if choice not in ("host", "join"):
-                return
-
-            code = None
-            if choice == "join":
-                code = self._code_entry_screen()
-                if not code:
-                    continue
+            if pending_code:
+                # --join-room: skip the menu and connect with this code.
+                choice, code = "join", pending_code
+                pending_code = None
+            else:
+                choice = self.watch_together_menu(notice=notice)
+                notice = ""
+                if choice not in ("host", "join"):
+                    return
+                code = None
+                if choice == "join":
+                    code = self._code_entry_screen()
+                    if not code:
+                        continue
 
             session = WatchTogetherSession(self, api)
             error = session.connect(code)
