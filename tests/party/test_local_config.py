@@ -18,7 +18,10 @@ from nyoanime.party.session_storage import (
     resolve_session_path,
     set_session_override,
 )
-from nyoanime.party.supabase_config import resolve_supabase_config
+from nyoanime.party.supabase_config import (
+    DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+    resolve_supabase_config,
+)
 
 
 def _isolate_env(monkeypatch):
@@ -69,7 +72,12 @@ def test_missing_local_env_changes_nothing(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPABASE_URL", "https://env.supabase.co")
 
     assert load_local_env(tmp_path / "missing.env") is None
-    assert resolve_supabase_config() is None
+    # Missing local files leave the bundled zero-config key in place while the
+    # explicit environment URL still wins.
+    assert resolve_supabase_config() == (
+        "https://env.supabase.co",
+        DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+    )
     assert local_config.os.environ["SUPABASE_URL"] == "https://env.supabase.co"
 
 

@@ -8,6 +8,8 @@ import nyoanime.party.client as client_module
 from nyoanime.party.client import PartyClientError, WTRClient
 from nyoanime.party.session_storage import FileSessionStorage
 from nyoanime.party.supabase_config import (
+    DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+    DEFAULT_SUPABASE_URL,
     resolve_supabase_config,
     use_supabase_transport,
 )
@@ -273,7 +275,11 @@ def test_config_resolution_and_transport_switch(monkeypatch, tmp_path):
     monkeypatch.delenv("SUPABASE_URL", raising=False)
     monkeypatch.delenv("SUPABASE_PUBLISHABLE_KEY", raising=False)
     monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
-    assert resolve_supabase_config() is None
+    # Zero-config builds fall back to the bundled public project credentials.
+    assert resolve_supabase_config() == (
+        DEFAULT_SUPABASE_URL,
+        DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+    )
 
     assert resolve_supabase_config("https://example.supabase.co", "pub") == (
         "https://example.supabase.co",
@@ -295,7 +301,9 @@ def test_config_never_accepts_service_role_style_secret_from_env(monkeypatch):
     monkeypatch.delenv("SUPABASE_PUBLISHABLE_KEY", raising=False)
     monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role-secret")
-    assert resolve_supabase_config() is None
+    resolved = resolve_supabase_config()
+    assert resolved == (DEFAULT_SUPABASE_URL, DEFAULT_SUPABASE_PUBLISHABLE_KEY)
+    assert "service-role-secret" not in resolved
 
 
 def _fake_factory(monkeypatch, fake):
