@@ -646,7 +646,7 @@ class _RoomRuntime:
                                 self.quit_requested = wants_quit
                                 break
 
-                        elif key in ("b", "B"):
+                        elif key in ("b", "B") and self.role == "host":
                             # Deliberately leave the runtime untouched: the room
                             # stays hosted while the main menu is in use.
                             break
@@ -690,17 +690,16 @@ class _RoomRuntime:
                                 self.show_diagnostics = False
                                 self._dirty = True
                             else:
-                                guest_hint = (
-                                    "Press [b] for the main menu, [l] to leave, "
-                                    "[i] for details, or [q] to quit."
+                                hint = (
+                                    "Press [l] to leave, [i] for details, "
+                                    "or [q] to quit."
                                 )
-                                host_hint = (
-                                    "Press [b] for the main menu, [l] to leave, "
-                                    "[i] for details, or [q] to quit."
-                                )
-                                self.set_notice(
-                                    host_hint if self.role == "host" else guest_hint
-                                )
+                                if self.role == "host":
+                                    hint = (
+                                        "Press [b] for the main menu, [l] to leave, "
+                                        "[i] for details, or [q] to quit."
+                                    )
+                                self.set_notice(hint)
 
                         await asyncio.sleep(_STATUS_POLL_SECONDS)
         finally:
@@ -2139,9 +2138,11 @@ class WatchTogetherUI:
     def _actions_text(
         self, model: Dict[str, Any], width: int, show_diagnostics: bool
     ) -> Text:
-        entries: List[Tuple[str, str, str]] = [
-            ("b", "Back to Main Menu", COLOR_ACCENT),
-        ]
+        entries: List[Tuple[str, str, str]] = []
+        if model["is_host"]:
+            # Guests stay on the room screen; only the host can detach the
+            # room view and drive playback from the main menus.
+            entries.append(("b", "Back to Main Menu", COLOR_ACCENT))
         entries.append(("l", "Leave Room", COLOR_ERROR))
         entries.append((
             "i",

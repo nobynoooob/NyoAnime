@@ -201,7 +201,7 @@ def test_guest_room_panel_identifies_host_and_you():
     assert "Bob" in output
     assert "[Host]" in output
     assert "[Guest]" in output
-    assert "[b] Back to Main Menu" in output
+    assert "[b] Back to Main Menu" not in output
     assert "[l] Leave Room" in output
     assert "[i] Details" in output
     assert "[q] Quit" in output
@@ -675,14 +675,14 @@ def test_host_footer_matches_streamlined_controls():
     )
 
 
-def test_guest_footer_can_also_return_to_menu():
+def test_guest_footer_has_no_menu_shortcut():
     ui = WatchTogetherUI(make_console())
     client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
 
     output = render(ui, ui._build_room_panel(ui.room_view_model(client)))
 
-    assert "[b] Back to Main Menu" in output
-    assert "[b] Back to Main Menu • [l] Leave Room • [i] Details • [q] Quit" in output
+    assert "[b] Back to Main Menu" not in output
+    assert "[l] Leave Room • [i] Details • [q] Quit" in output
 
 
 @pytest.mark.asyncio
@@ -710,6 +710,29 @@ async def test_back_to_menu_keeps_room_runtime_alive(monkeypatch):
     await runtime.stop()
     assert client.poll_stopped == 1
     assert "episode_changed" in client.unsubscribed
+
+
+@pytest.mark.asyncio
+async def test_guest_cannot_leave_the_room_for_the_main_menu(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+
+    RecordingLive.instances.clear()
+    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
+
+    # [b] is ignored for guests; only leaving the room ends the screen.
+    keys = iter(["b", "l"])
+    monkeypatch.setattr(ww, "RawTerminal", NoopRaw)
+    monkeypatch.setattr(ww, "Live", RecordingLive)
+    monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
+
+    assert await ui._room_screen(client, runtime=runtime) is True
+    assert client.leave_calls == 1
+    renders = "\n".join(render_text(row) for row in RecordingLive.instances[0].renders)
+    assert "[b] Back to Main Menu" not in renders
+    await runtime.stop()
 
 
 def test_session_survives_back_and_leave_tears_it_down(monkeypatch):
@@ -798,17 +821,15 @@ def test_join_code_skips_the_host_join_menu(monkeypatch):
     monkeypatch.setattr(
         ui, "watch_together_menu", lambda **kwargs: pytest.fail("menu was shown")
     )
-    keys = iter(["b"])
+    keys = iter(["l"])
     monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
 
     try:
         ui.handle_watch_together(None, join_code="378854")
 
         assert client.join_calls == ["378854"]
-        status = ui.room_status()
-        assert status is not None
-        assert status["room_code"] == "378854"
-        assert status["role"] == "guest"
+        assert client.leave_calls == 1
+        assert ui.room_status() is None
     finally:
         ui.shutdown()
 
