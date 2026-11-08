@@ -21,7 +21,16 @@ _COALESCED_COMMANDS = {
     ("set_property", "time-pos"): "time-pos",
     ("set_property", "speed"): "speed",
     ("set_property", "volume"): "volume",
+    ("show-text",): "show-text",
 }
+
+
+def _coalesced_key(cmd: list) -> Optional[str]:
+    if len(cmd) >= 2:
+        key = _COALESCED_COMMANDS.get((cmd[0], cmd[1]))
+        if key is not None:
+            return key
+    return _COALESCED_COMMANDS.get((cmd[0],)) if cmd else None
 
 
 class MPVController:
@@ -276,6 +285,12 @@ class MPVController:
     async def cycle_subtitles(self) -> None:
         await self._send_command(["cycle", "sub"])
 
+    async def show_osd(self, text: str, duration_ms: int = 1400) -> None:
+        """Brief MPV overlay; queued like every other command."""
+        await self._send_command(
+            ["show-text", str(text), max(200, int(duration_ms))]
+        )
+
     def _ensure_command_worker(self) -> None:
         task = self._command_task
         if task is not None and not task.done():
@@ -375,7 +390,7 @@ class MPVController:
         wakeup = self._command_wakeup
         if wakeup is None or self._command_task is None:
             raise RuntimeError("MPV IPC command queue is unavailable")
-        key = _COALESCED_COMMANDS.get((cmd[0], cmd[1])) if len(cmd) >= 2 else None
+        key = _coalesced_key(cmd)
         if key is not None:
             # Latest value wins; never queue two seeks/speeds/pauses.
             self._command_pending[key] = list(cmd)

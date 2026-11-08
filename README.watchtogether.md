@@ -9,6 +9,7 @@ Watch Together enables synchronized, collaborative anime viewing across local ne
 - **Room creation**: Host a watch party and share an invitation code.
 - **Guest joining**: Join an existing room with a code.
 - **Synchronized playback**: Host playback state is reflected in guest players via accurate position tracking and drift compensation.
+- **Per-client stream offset**: Guests on a different version (for example a dub with an extra intro) can nudge their own timeline with `[` / `]` and reset with `0`; the last offset is remembered per provider and language.
 - **Chat and reactions**: Optional room chat with nicknames.
 - **Ready management**: Guests report readiness; host can start when everyone is ready.
 - **Provider compatibility**: Guests resolve anime locally through existing NyoAnime providers; no credentials or cookies are relayed.
@@ -165,6 +166,8 @@ The relay transmits typed events:
 ```
 
 The host is authoritative; guests never send playback control events except for volume and local subtitle selections.
+
+Each guest can keep a local `stream_time_offset`, added to the host timeline when that guest seeks. `[` subtracts 0.5s, `]` adds 0.5s, and `0` resets it; MPV shows a short OSD confirmation. The host timeline itself is never modified by a guest's offset. Offsets are stored in `~/.nyoanime/database/stream_offsets.json`, keyed by canonical provider id and language mode, and reapplied when the same provider is used again.
 
 The relay deduplicates, orders, and forwards messages; it does not store unnecessary history beyond active rooms.
 

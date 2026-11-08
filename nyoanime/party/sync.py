@@ -10,6 +10,12 @@ position is therefore::
 
     host_position + max(0, (now - offset - timestamp_ms) / 1000) * speed
 
+A guest's ``stream_time_offset`` shifts only its own target, never the host
+timeline published to the room. It compensates for version differences such as
+an extra studio intro on a dub:
+
+    target = host_position + stream_time_offset
+
 Drift thresholds are configured as ``(gentle, seek)``:
     |drift| < gentle          -> leave the player alone
     gentle <= |drift| < seek  -> temporary speed nudge, restored to 1.0
@@ -70,6 +76,7 @@ class SyncEngine:
         self.state = SyncState.DISCONNECTED
         self.host_playback: Optional[Dict[str, Any]] = None
         self.local_position = 0.0
+        self.stream_time_offset = 0.0
         self.sequence = 0
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.last_correction_time = 0.0
@@ -129,6 +136,24 @@ class SyncEngine:
 
     def set_state(self, state: SyncState) -> None:
         self._set_state(state)
+
+    def set_stream_time_offset(self, seconds: float) -> float:
+        """Set this client's offset from the shared timeline, in seconds."""
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value != value:  # NaN
+            value = 0.0
+        self.stream_time_offset = max(-120.0, min(120.0, value))
+        return self.stream_time_offset
+
+    def adjust_stream_time_offset(self, delta: float) -> float:
+        try:
+            step = float(delta)
+        except (TypeError, ValueError):
+            step = 0.0
+        return self.set_stream_time_offset(self.stream_time_offset + step)
 
     # ------------------------------------------------------------------
     # Host
@@ -307,6 +332,9 @@ class SyncEngine:
             self.clock_offset_ms = max(0.0, sample)
         elapsed = max(0.0, (now_ms - self.clock_offset_ms - timestamp_ms) / 1000.0)
         estimated_host = host_pos + (0.0 if host_paused else elapsed * host_speed)
+        # Per-client only: the published host timeline stays the absolute
+        # reference, so one guest's version offset cannot move anyone else.
+        target = max(0.0, estimated_host + self.stream_time_offset)
 
         try:
             local_pos = self.mpv.get_position()
@@ -315,7 +343,7 @@ class SyncEngine:
             return
 
         self.local_position = local_pos
-        drift = estimated_host - local_pos
+        drift = target - local_pos
         self.last_drift = drift
         self.on_drift(drift)
 
@@ -330,7 +358,7 @@ class SyncEngine:
         if host_paused:
             if abs(drift) >= self.drift_thresholds[0]:
                 try:
-                    await self.mpv.seek_absolute(estimated_host)
+                    await self.mpv.seek_absolute(target)
                 except Exception as exc:
                     self.on_error(exc)
             if not local_paused:
@@ -353,7 +381,7 @@ class SyncEngine:
         gentle, seek = self.drift_thresholds
         if abs(drift) >= seek:
             try:
-                await self.mpv.seek_absolute(estimated_host)
+                await self.mpv.seek_absolute(target)
                 self.last_correction_time = time.monotonic()
                 self.correction_count += 1
                 self._speed_restore_at = None

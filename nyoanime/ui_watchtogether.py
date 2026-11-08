@@ -56,6 +56,11 @@ from .party.lobby import (
 )
 from .party.mpv_controller import MPVController
 from .party.protocol import PartyEvent, sanitize_diagnostic
+from .party.stream_offsets import (
+    canonical_provider_id,
+    load_stream_offset,
+    save_stream_offset,
+)
 from .party.supabase_config import SupabaseConfigError
 from .party.sync import SyncEngine, SyncState
 from .providers.language import language_badge, normalize_language_mode, provider_language_mode
@@ -93,7 +98,16 @@ _RECONNECT_RETRY_SECONDS = 4.0
 _LOBBY_DEADLINE_SECONDS = 20.0
 _LEAVE_TIMEOUT_SECONDS = 8.0
 _SYNC_APPLY_TIMEOUT_SECONDS = 5.0
+_STREAM_OFFSET_STEP_SECONDS = 0.5
+_STREAM_OFFSET_OSD_MS = 1400
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+def _format_stream_offset(seconds: float) -> str:
+    value = 0.0 if abs(float(seconds)) < 0.05 else float(seconds)
+    if value == 0.0:
+        return "Sync Offset: 0.0s"
+    return f"Sync Offset: {value:+.1f}s"
 
 
 class _RoomPlayback:
@@ -106,6 +120,9 @@ class _RoomPlayback:
         self.mpv: Optional[MPVController] = None
         self.sync: Optional[SyncEngine] = None
         self.stream_key: Optional[str] = None
+        self.offset_provider = ""
+        self.offset_mode = ""
+        self.stream_time_offset = 0.0
 
     @property
     def active(self) -> bool:
@@ -128,11 +145,32 @@ class _RoomPlayback:
         )
         self.sync.on_error = self._handle_sync_error
 
+        provider_id = str(
+            playback.get("provider_id") or reference.get("provider_id") or ""
+        )
+        mode = str(playback.get("language_mode") or "")
+        if not mode and provider_id:
+            mode = provider_language_mode(provider_id)
+        if not mode:
+            mode = str(reference.get("language_mode") or "")
+        self.offset_provider = canonical_provider_id(provider_id)
+        self.offset_mode = normalize_language_mode(mode)
+        self.stream_time_offset = 0.0
+        start_time = float(playback.get("start_time") or 0.0)
+        if self.role == "guest":
+            saved = load_stream_offset(self.offset_provider, self.offset_mode)
+            if saved:
+                # Apply before launch so the first host heartbeat doesn't have
+                # to yank the stream forward by the whole intro offset.
+                self.stream_time_offset = saved
+                self.sync.set_stream_time_offset(saved)
+                start_time = max(0.0, start_time + saved)
+
         try:
             await self.mpv.connect(
                 url=url,
                 title=str(playback.get("title") or reference.get("title") or "Watch Together"),
-                start_time=float(playback.get("start_time") or 0.0),
+                start_time=start_time,
                 audio_lang=playback.get("audio_lang") or None,
                 headers=playback.get("headers") or None,
                 subtitle_url=playback.get("subtitle_url") or None,
@@ -163,6 +201,9 @@ class _RoomPlayback:
         sync, self.sync = self.sync, None
         self.mpv = None
         self.stream_key = None
+        self.offset_provider = ""
+        self.offset_mode = ""
+        self.stream_time_offset = 0.0
         if sync is not None:
             try:
                 await sync.stop()
@@ -1040,6 +1081,50 @@ class _RoomRuntime:
     def _on_playback_error(self, exc: Exception) -> None:
         self.set_notice(self.owner._playback_error_notice(exc))
 
+    async def adjust_stream_offset(self, delta: float) -> None:
+        """Nudge this client's offset without moving any other client's."""
+        playback = self.playback
+        sync = playback.sync
+        if sync is None:
+            return
+        previous = float(sync.stream_time_offset or 0.0)
+        current = sync.adjust_stream_time_offset(delta)
+        delta = current - previous
+        playback.stream_time_offset = current
+        mpv = playback.mpv
+        target = None
+        if mpv is not None:
+            try:
+                target = max(0.0, float(mpv.get_position()) + delta)
+            except Exception:
+                target = None
+        if delta and mpv is not None and target is not None:
+            if self.role == "host":
+                # A host nudge is a real master seek; guests follow on the
+                # next heartbeat. Their own offsets remain untouched.
+                self._spawn(sync.host_seek(target))
+            else:
+                try:
+                    await mpv.seek_absolute(target)
+                except Exception as exc:
+                    logger.debug("Watch Together offset seek failed: %s", exc)
+        if mpv is not None:
+            try:
+                await mpv.show_osd(
+                    _format_stream_offset(current),
+                    duration_ms=_STREAM_OFFSET_OSD_MS,
+                )
+            except Exception as exc:
+                logger.debug("Watch Together offset OSD failed: %s", exc)
+        if self.role == "guest":
+            save_stream_offset(
+                playback.offset_provider,
+                playback.offset_mode,
+                current,
+            )
+        self.set_notice(_format_stream_offset(current))
+        self._dirty = True
+
     def set_notice(self, value: str) -> None:
         self.notice = value
         self.notice_until = time.monotonic() + 4.0 if value else 0.0
@@ -1372,6 +1457,20 @@ class _RoomRuntime:
                                 self.quit_requested = wants_quit
                                 break
 
+                        elif key in ("[", "]") and self.playback.active:
+                            await self.adjust_stream_offset(
+                                -_STREAM_OFFSET_STEP_SECONDS
+                                if key == "["
+                                else _STREAM_OFFSET_STEP_SECONDS
+                            )
+
+                        elif key == "0" and self.playback.active:
+                            sync = self.playback.sync
+                            current = float(
+                                getattr(sync, "stream_time_offset", 0.0) or 0.0
+                            )
+                            await self.adjust_stream_offset(-current)
+
                         elif key in ("b", "B") and self.role == "host":
                             # Deliberately leave the runtime untouched: the room
                             # stays hosted while the main menu is in use.
@@ -1458,13 +1557,14 @@ class _RoomRuntime:
                                     )
                                 else:
                                     hint = (
-                                        "Press [l] to leave, [i] for details, "
-                                        "or [q] to quit."
+                                        "Press [ / ] to nudge sync, [l] to leave, "
+                                        "[i] for details, or [q] to quit."
                                     )
                                     if self.role == "host":
                                         hint = (
-                                            "Press [b] for the main menu, [l] to leave, "
-                                            "[i] for details, or [q] to quit."
+                                            "Press [b] for the main menu, [ / ] to nudge "
+                                            "sync, [l] to leave, [i] for details, "
+                                            "or [q] to quit."
                                         )
                                 self.set_notice(hint)
 

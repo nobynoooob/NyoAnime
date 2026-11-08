@@ -399,3 +399,113 @@ async def test_pause_then_resume_round_trips_to_the_guest():
         assert guest.state == SyncState.PLAYING
     finally:
         await host.stop()
+
+
+def _guest_engine(mock_mpv_controller):
+    engine = SyncEngine(mpv_controller=mock_mpv_controller, role="guest")
+    engine.state = SyncState.LOBBY
+    engine.on_error = lambda exc: None
+    return engine
+
+
+def _host_payload(sequence, position=0.0, timestamp_ms=None, paused=False):
+    return {
+        "position": position,
+        "duration": 100.0,
+        "paused": paused,
+        "speed": 1.0,
+        "anime_reference": {},
+        "host": True,
+        "sequence": sequence,
+        "timestamp_ms": int(time.time() * 1000)
+        if timestamp_ms is None
+        else timestamp_ms,
+    }
+
+
+@pytest.mark.asyncio
+async def test_guest_target_adds_a_positive_stream_offset(mock_mpv_controller):
+    engine = _guest_engine(mock_mpv_controller)
+    mock_mpv_controller.get_position.return_value = 10.0
+    mock_mpv_controller.is_paused.return_value = False
+    engine.set_stream_time_offset(5.0)
+
+    await engine.apply_host_state(_host_payload(1, position=10.0))
+
+    # target = host + 5 = 15; drift 5 exceeds the seek threshold.
+    mock_mpv_controller.seek_absolute.assert_awaited_once()
+    assert mock_mpv_controller.seek_absolute.await_args.args[0] == pytest.approx(
+        15.0, abs=0.05
+    )
+    assert engine.last_drift == pytest.approx(5.0, abs=0.05)
+    assert engine.host_playback["position"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_guest_target_adds_a_negative_stream_offset(mock_mpv_controller):
+    engine = _guest_engine(mock_mpv_controller)
+    mock_mpv_controller.get_position.return_value = 10.0
+    mock_mpv_controller.is_paused.return_value = False
+    engine.set_stream_time_offset(-3.0)
+
+    await engine.apply_host_state(_host_payload(2, position=10.0))
+
+    mock_mpv_controller.seek_absolute.assert_awaited_once()
+    assert mock_mpv_controller.seek_absolute.await_args.args[0] == pytest.approx(
+        7.0, abs=0.05
+    )
+
+
+@pytest.mark.asyncio
+async def test_small_stream_offset_stays_inside_the_gentle_threshold(
+    mock_mpv_controller,
+):
+    engine = _guest_engine(mock_mpv_controller)
+    mock_mpv_controller.get_position.return_value = 10.0
+    mock_mpv_controller.is_paused.return_value = False
+    engine.set_stream_time_offset(0.2)
+
+    await engine.apply_host_state(_host_payload(3, position=10.0))
+
+    mock_mpv_controller.seek_absolute.assert_not_awaited()
+    mock_mpv_controller.set_speed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stream_offset_still_uses_the_configured_nudge_threshold(
+    mock_mpv_controller,
+):
+    engine = _guest_engine(mock_mpv_controller)
+    mock_mpv_controller.get_position.return_value = 10.0
+    mock_mpv_controller.is_paused.return_value = False
+    engine.set_stream_time_offset(1.0)
+
+    await engine.apply_host_state(_host_payload(4, position=10.0))
+
+    # 1.0s is gentle (0.5..1.5): speed nudge, not a hard seek.
+    mock_mpv_controller.seek_absolute.assert_not_awaited()
+    mock_mpv_controller.set_speed.assert_awaited_once()
+
+
+def test_stream_offset_clamps_and_resets(mock_mpv_controller):
+    engine = _guest_engine(mock_mpv_controller)
+    assert engine.set_stream_time_offset(999) == 120.0
+    assert engine.set_stream_time_offset(-999) == -120.0
+    assert engine.adjust_stream_time_offset(0.5) == -119.5
+    assert engine.set_stream_time_offset(0) == 0.0
+
+
+def test_host_payload_ignores_the_local_stream_offset(mock_mpv_controller):
+    engine = SyncEngine(mpv_controller=mock_mpv_controller, role="host")
+    mock_mpv_controller.get_playback_state.return_value = {
+        "position": 42.0,
+        "duration": 100.0,
+        "paused": False,
+        "speed": 1.0,
+    }
+    engine.set_stream_time_offset(5.0)
+
+    payload = engine._build_host_payload()
+
+    assert payload["position"] == 42.0
+    assert "stream_time_offset" not in payload

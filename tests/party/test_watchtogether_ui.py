@@ -2,6 +2,7 @@
 import asyncio
 import io
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from rich.console import Console
@@ -1614,3 +1615,136 @@ async def test_guest_leave_timeout_exits_instead_of_freezing(monkeypatch):
     started = time.monotonic()
     assert await ui._room_screen(client) is True
     assert time.monotonic() - started < 2.0
+
+
+def test_stream_offset_osd_formatting():
+    import nyoanime.ui_watchtogether as ww
+
+    assert ww._format_stream_offset(2.5) == "Sync Offset: +2.5s"
+    assert ww._format_stream_offset(-0.5) == "Sync Offset: -0.5s"
+    assert ww._format_stream_offset(0.01) == "Sync Offset: 0.0s"
+
+
+@pytest.mark.asyncio
+async def test_guest_offset_hotkeys_nudge_and_persist(monkeypatch, tmp_path):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.stream_offsets import load_stream_offset
+    from nyoanime.party.sync import SyncEngine
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class DummyLive:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def update(self, renderable, refresh=False):
+            pass
+
+    class DummyRaw:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    keys = iter(["]", "]", "0", "]", "l"])
+    monkeypatch.setattr(ww, "RawTerminal", DummyRaw)
+    monkeypatch.setattr(ww, "Live", DummyLive)
+    monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
+
+    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
+    ui = WatchTogetherUI(make_console())
+    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
+
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
+    mpv = MagicMock()
+    mpv.get_position.return_value = 30.0
+    mpv.seek_absolute = AsyncMock()
+    mpv.show_osd = AsyncMock()
+    mpv.disconnect = AsyncMock()
+    runtime.playback.mpv = mpv
+    runtime.playback.sync = SyncEngine(mpv, role="guest")
+    runtime.playback.offset_provider = "hianime_dub"
+    runtime.playback.offset_mode = "en_dub"
+
+    assert await ui._room_screen(client, runtime=runtime) is True
+
+    shown = [call.args[0] for call in mpv.show_osd.await_args_list]
+    assert shown == [
+        "Sync Offset: +0.5s",
+        "Sync Offset: +1.0s",
+        "Sync Offset: 0.0s",
+        "Sync Offset: +0.5s",
+    ]
+    assert mpv.seek_absolute.await_count == 4
+    assert load_stream_offset("hianime_dub", "en_dub") == 0.5
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_guest_playback_loads_a_saved_provider_offset(monkeypatch, tmp_path):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.stream_offsets import save_stream_offset
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_stream_offset("hianime_dub", "en_dub", 4.5)
+
+    captured = {}
+
+    class FakeMPV:
+        def __init__(self, host=False):
+            pass
+
+        async def connect(self, **kwargs):
+            captured.update(kwargs)
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(ww, "MPVController", FakeMPV)
+    playback = ww._RoomPlayback("guest")
+    await playback.start(
+        {"url": "https://example.com/a.m3u8", "provider_id": "hianime_dub"},
+        {"title": "Test", "language_mode": "en_dub"},
+    )
+
+    assert playback.offset_provider == "hianime_dub"
+    assert playback.offset_mode == "en_dub"
+    assert playback.sync.stream_time_offset == 4.5
+    assert captured["start_time"] == 4.5
+    await playback.stop()
+
+
+@pytest.mark.asyncio
+async def test_host_offset_hotkey_moves_the_master_timeline_only(tmp_path, monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.sync import SyncEngine, SyncState
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = FakeClient(role="host", channels_ready=True, nickname="Alice")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+
+    mpv = MagicMock()
+    mpv.get_position.return_value = 10.0
+    mpv.show_osd = AsyncMock()
+    mpv.disconnect = AsyncMock()
+    sync = SyncEngine(mpv, role="host")
+    sync.state = SyncState.PLAYING
+    sync.host_seek = AsyncMock()
+    runtime.playback.mpv = mpv
+    runtime.playback.sync = sync
+
+    await runtime.adjust_stream_offset(0.5)
+    await asyncio.sleep(0)
+
+    assert sync.stream_time_offset == 0.5
+    sync.host_seek.assert_awaited_once_with(10.5)
+    assert not (tmp_path / ".nyoanime" / "database" / "stream_offsets.json").exists()

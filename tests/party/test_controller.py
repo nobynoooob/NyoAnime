@@ -299,3 +299,49 @@ async def test_failed_ipc_write_is_dropped_and_the_worker_survives():
 
     assert ["set_property", "speed", 1.2] in calls
     assert ["set_property", "pause", True] in calls
+
+
+@pytest.mark.asyncio
+async def test_show_osd_is_queued_like_any_other_command():
+    ctrl = MPVController(host=False)
+    ctrl.session = {
+        'tracker': MagicMock(state={'time_pos': 0.0, 'duration': 100.0, 'paused': False}),
+        'sock_path': '/tmp/fake.sock',
+        'process': MagicMock(),
+    }
+    sent = []
+
+    def write(sock_path, command, request_id=None, timeout=1.5):
+        sent.append(command)
+        return None
+
+    with patch('nyoanime.player.PlayerManager.send_mpv_command', side_effect=write):
+        await ctrl.show_osd("Sync Offset: +2.5s")
+        await ctrl.flush(timeout=2.0)
+
+    assert sent[-1] == ["show-text", "Sync Offset: +2.5s", 1400]
+
+
+@pytest.mark.asyncio
+async def test_rapid_osd_updates_only_render_the_newest_text():
+    ctrl = MPVController(host=False)
+    ctrl.session = {
+        'tracker': MagicMock(state={'time_pos': 0.0, 'duration': 100.0, 'paused': False}),
+        'sock_path': '/tmp/fake.sock',
+        'process': MagicMock(),
+    }
+    sent = []
+
+    def write(sock_path, command, request_id=None, timeout=1.5):
+        sent.append(command)
+        time.sleep(0.03)
+        return None
+
+    with patch('nyoanime.player.PlayerManager.send_mpv_command', side_effect=write):
+        await ctrl.show_osd("Sync Offset: +0.5s")
+        await ctrl.show_osd("Sync Offset: +1.0s")
+        await ctrl.show_osd("Sync Offset: +1.5s")
+        await ctrl.flush(timeout=2.0)
+
+    assert sent[-1] == ["show-text", "Sync Offset: +1.5s", 1400]
+    assert len(sent) <= 2
