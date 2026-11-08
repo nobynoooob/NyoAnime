@@ -91,6 +91,8 @@ _STATE_REFRESH_SECONDS = 5.0
 _STATUS_POLL_SECONDS = 0.06
 _RECONNECT_RETRY_SECONDS = 4.0
 _LOBBY_DEADLINE_SECONDS = 20.0
+_LEAVE_TIMEOUT_SECONDS = 8.0
+_SYNC_APPLY_TIMEOUT_SECONDS = 5.0
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 
@@ -196,6 +198,8 @@ class _RoomRuntime:
         self._state_task: Optional[asyncio.Task] = None
         self._retry_task: Optional[asyncio.Task] = None
         self._playback_task: Optional[asyncio.Task] = None
+        self._sync_task: Optional[asyncio.Task] = None
+        self._pending_sync: Optional[Dict[str, Any]] = None
         self._subscriptions: List[Tuple[str, Callable[[Any], None]]] = []
         self._closed = False
         self._stopped = False
@@ -279,16 +283,19 @@ class _RoomRuntime:
             return
         self._stopped = True
         self._closed = True
+        self._pending_sync = None
         for task in (
             self._bg_task,
             self._state_task,
             self._retry_task,
             self._playback_task,
+            self._sync_task,
             self._lobby_task,
         ):
             await self._cancel_task(task)
         self._bg_task = self._state_task = self._retry_task = None
-        self._playback_task = self._lobby_task = None
+        self._playback_task = self._lobby_task = self._sync_task = None
+        self._pending_sync = None
         await self.playback.stop()
         stop_poll = getattr(self.client, "stop_playback_poll", None)
         if callable(stop_poll):
@@ -458,14 +465,20 @@ class _RoomRuntime:
     # ------------------------------------------------------------------
     # Events
     # ------------------------------------------------------------------
-    def _spawn(self, coro) -> None:
+    def _spawn_task(self, coro) -> Optional[asyncio.Task]:
         try:
             if self._loop is not None and self._loop.is_running():
-                self._loop.create_task(coro)
-            else:
-                asyncio.ensure_future(coro)
+                return self._loop.create_task(coro)
+            return asyncio.ensure_future(coro)
         except RuntimeError:
             logger.debug("Watch Together event arrived after the room stopped")
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+
+    def _spawn(self, coro) -> None:
+        self._spawn_task(coro)
 
     def _on_episode_changed(self, message: Any) -> None:
         # Update the visible pick synchronously; only the MPV swap is async.
@@ -516,20 +529,52 @@ class _RoomRuntime:
         self._dirty = True
 
     async def _stop_guest_playback(self) -> None:
+        self._pending_sync = None
+        await self._cancel_task(self._sync_task)
+        self._sync_task = None
         await self._cancel_task(self._playback_task)
         self._playback_task = None
         await self.playback.stop()
 
     def _on_sync_playback(self, message: Any) -> None:
-        if not self.playback.active:
+        if self._closed or not self.playback.active:
             return
         payload = (
             message.get("payload")
             if isinstance(message, dict)
             else getattr(message, "payload", None)
         )
-        if isinstance(payload, dict):
-            self._spawn(self.playback.apply_sync(payload))
+        if not isinstance(payload, dict):
+            return
+        # One pump, latest payload wins: a burst of host updates must not spawn
+        # a task per message or queue stale corrections behind a slow player.
+        self._pending_sync = payload
+        task = self._sync_task
+        if task is None or task.done():
+            self._sync_task = self._spawn_task(self._drain_sync())
+
+    async def _drain_sync(self) -> None:
+        try:
+            while self._pending_sync is not None:
+                payload = self._pending_sync
+                self._pending_sync = None
+                if not self.playback.active:
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self.playback.apply_sync(payload),
+                        timeout=_SYNC_APPLY_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("Watch Together sync update timed out")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Watch Together sync update dropped: %s", exc)
+        finally:
+            self._sync_task = None
+            if self._pending_sync is not None and not self._closed:
+                self._sync_task = self._spawn_task(self._drain_sync())
 
     def _on_room_state(self, message: Any) -> None:
         reference = self.owner._reference_from_message(message)
@@ -1263,30 +1308,66 @@ class _RoomRuntime:
 
                         if key in ("l", "L", "q", "Q"):
                             wants_quit = key in ("q", "Q")
+                            self._pending_sync = None
+                            await self._cancel_task(self._sync_task)
+                            self._sync_task = None
                             await self._cancel_task(self._playback_task)
                             self._playback_task = None
                             self.busy = "Leaving the room..."
-                            await self.playback.stop()
+                            # Leave and teardown run side by side; neither is
+                            # allowed to freeze the key loop on a dead socket.
+                            stop_task = asyncio.create_task(self.playback.stop())
                             leave_task = asyncio.create_task(self.client.leave_room())
+                            pending = {stop_task, leave_task}
+                            timed_out = False
+                            deadline = time.monotonic() + _LEAVE_TIMEOUT_SECONDS
                             frame = 0
-                            while not leave_task.done():
+                            while pending:
                                 frame += 1
                                 live.update(
                                     self._view("Leaving the room..."),
                                     refresh=True,
                                 )
-                                await asyncio.sleep(0.08)
-                            self.busy = ""
-                            try:
-                                leave_task.result()
-                            except Exception as exc:
-                                _, message, technical = self.owner._friendly_error(
-                                    exc, "leave"
+                                _, pending = await asyncio.wait(
+                                    pending, timeout=0.08
                                 )
-                                self.leave_error = message
-                                self.technical = technical
-                                self.set_notice("")
+                                if pending and time.monotonic() >= deadline:
+                                    timed_out = True
+                                    for task in pending:
+                                        task.cancel()
+                                    await asyncio.gather(
+                                        *pending, return_exceptions=True
+                                    )
+                                    pending = set()
+                            self.busy = ""
+                            if stop_task.done() and not stop_task.cancelled():
+                                try:
+                                    stop_task.result()
+                                except Exception:
+                                    pass
+                            leave_error = None
+                            if leave_task.cancelled():
+                                leave_error = (
+                                    "The server didn't confirm the leave in time."
+                                )
                             else:
+                                try:
+                                    leave_task.result()
+                                except Exception as exc:
+                                    _, message, technical = self.owner._friendly_error(
+                                        exc, "leave"
+                                    )
+                                    leave_error = message
+                                    self.technical = technical
+                            stay = False
+                            if leave_error is not None:
+                                self.leave_error = leave_error
+                                self.set_notice("")
+                                self._dirty = True
+                                # Quit and timed-out leaves exit locally: a
+                                # dead server must never trap the guest.
+                                stay = not (wants_quit or timed_out)
+                            if not stay:
                                 self.left = True
                                 self.quit_requested = wants_quit
                                 break

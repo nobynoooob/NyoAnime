@@ -5,11 +5,23 @@ Playback commands are always local. Authority over *shared* playback lives in
 SyncEngine; a guest still has to pause/seek its own player to stay in sync.
 """
 import asyncio
+import logging
 import os
 import time
 from typing import Any, Callable, Dict, Optional
 
 from nyoanime.player import PlayerManager
+
+logger = logging.getLogger(__name__)
+
+# Commands that supersede an identical pending command. A sync burst can
+# otherwise pile up seeks while MPV is rebuffering.
+_COALESCED_COMMANDS = {
+    ("set_property", "pause"): "pause",
+    ("set_property", "time-pos"): "time-pos",
+    ("set_property", "speed"): "speed",
+    ("set_property", "volume"): "volume",
+}
 
 
 class MPVController:
@@ -18,14 +30,24 @@ class MPVController:
         host: bool = False,
         player_manager: Optional[PlayerManager] = None,
         pause_poll_interval: float = 0.15,
+        command_timeout: float = 1.5,
     ):
         self.host = host
         self.player_manager = player_manager or PlayerManager()
         self.session: Optional[Dict[str, Any]] = None
         self.on_pause_change: Optional[Callable[[bool, float], Any]] = None
         self.pause_poll_interval = max(0.05, float(pause_poll_interval))
+        self.command_timeout = max(0.2, float(command_timeout))
         self._pause_monitor_task: Optional[asyncio.Task] = None
         self._last_known_pause: Optional[bool] = None
+        self._pause_suppress_until = 0.0
+        # All IPC writes go through one worker so a slow/unresponsive MPV
+        # socket never blocks the event loop or a sync callback.
+        self._command_task: Optional[asyncio.Task] = None
+        self._command_queue: Optional[asyncio.Queue] = None
+        self._command_pending: Dict[str, list] = {}
+        self._command_wakeup: Optional[asyncio.Event] = None
+        self._command_active = False
 
     @property
     def connected(self) -> bool:
@@ -61,6 +83,11 @@ class MPVController:
                 if self._last_known_pause is None:
                     self._last_known_pause = paused
                 elif paused != self._last_known_pause:
+                    if time.monotonic() < self._pause_suppress_until:
+                        # The player hasn't applied our command yet; the old
+                        # value is not a user-driven change.
+                        await asyncio.sleep(self.pause_poll_interval)
+                        continue
                     self._last_known_pause = paused
                     callback = self.on_pause_change
                     if callback is not None:
@@ -97,6 +124,9 @@ class MPVController:
         if not session:
             raise RuntimeError("Failed to launch MPV")
         self.session = session
+        self._command_queue = asyncio.Queue()
+        self._command_pending.clear()
+        self._ensure_command_worker()
         await self.wait_for_ipc(kwargs.get("ipc_timeout", 10.0))
         self._ensure_pause_monitor()
 
@@ -136,6 +166,18 @@ class MPVController:
                 await monitor
             except (asyncio.CancelledError, Exception):
                 pass
+        worker, self._command_task = self._command_task, None
+        if worker is not None and not worker.done():
+            worker.cancel()
+            try:
+                await worker
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._command_queue = None
+        self._command_pending.clear()
+        self._command_wakeup = None
+        self._command_active = False
+        self._pause_suppress_until = 0.0
         self._last_known_pause = None
         session = self.session
         if not session:
@@ -159,7 +201,9 @@ class MPVController:
         tracker = session.get("tracker")
         if tracker and hasattr(tracker, "stop"):
             try:
-                tracker.stop()
+                # The tracker's socket read can take up to its timeout; keep
+                # that wait off the event loop.
+                await asyncio.to_thread(tracker.stop)
             except Exception:
                 pass
         self.session = None
@@ -202,8 +246,10 @@ class MPVController:
         paused = bool(paused)
         await self._send_command(["set_property", "pause", paused])
         # Optimistic: suppresses an echo when this command is ours. If it
-        # fails, the monitor still reports the real value on its next tick.
+        # fails, the monitor still reports the real value after the grace
+        # window on its next tick.
         self._last_known_pause = paused
+        self._pause_suppress_until = time.monotonic() + 0.5
 
     async def play(self) -> None:
         # mpv has no `play` command; resuming is clearing the pause property.
@@ -230,16 +276,114 @@ class MPVController:
     async def cycle_subtitles(self) -> None:
         await self._send_command(["cycle", "sub"])
 
+    def _ensure_command_worker(self) -> None:
+        task = self._command_task
+        if task is not None and not task.done():
+            return
+        if self.session is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._command_queue is None:
+            self._command_queue = asyncio.Queue()
+        if self._command_wakeup is None:
+            self._command_wakeup = asyncio.Event()
+        self._command_task = loop.create_task(self._command_loop())
+
+    async def _command_loop(self) -> None:
+        try:
+            while self.session is not None:
+                wakeup = self._command_wakeup
+                if wakeup is None:
+                    return
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                wakeup.clear()
+                await self._drain_commands()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._command_task = None
+            self._command_active = False
+
+    async def _drain_commands(self) -> None:
+        queue = self._command_queue
+        if queue is not None:
+            while True:
+                try:
+                    cmd = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await self._run_command(cmd)
+        for key in list(self._command_pending):
+            cmd = self._command_pending.pop(key, None)
+            if cmd is not None:
+                await self._run_command(cmd)
+
+    async def _run_command(self, cmd: list) -> None:
+        session = self.session
+        if session is None:
+            return
+        sock_path = session.get("sock_path")
+        if not sock_path:
+            return
+        self._command_active = True
+        try:
+            # The worker owns this await. A wedged socket degrades to a
+            # dropped command instead of a stalled sync callback.
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    PlayerManager.send_mpv_command,
+                    sock_path,
+                    cmd,
+                    None,
+                    self.command_timeout,
+                ),
+                timeout=self.command_timeout + 0.5,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.debug("MPV IPC command timed out: %s", cmd)
+        except Exception as exc:
+            logger.debug("MPV IPC command dropped (%s): %s", exc, cmd)
+        finally:
+            self._command_active = False
+
+    async def flush(self, timeout: float = 2.0) -> None:
+        """Wait until queued commands were attempted, ignoring failures."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.05, float(timeout))
+        while loop.time() < deadline:
+            queue_empty = self._command_queue is None or self._command_queue.empty()
+            if queue_empty and not self._command_pending and not self._command_active:
+                return
+            if self._command_task is None or self._command_task.done():
+                return
+            await asyncio.sleep(0.01)
+
     async def _send_command(self, cmd: list) -> None:
         if not self.session:
             raise RuntimeError("MPV not connected")
-        sock_path = self.session.get("sock_path")
-        if not sock_path:
+        if not self.session.get("sock_path"):
             raise RuntimeError("MPV IPC socket is unavailable")
-        try:
-            await asyncio.to_thread(PlayerManager.send_mpv_command, sock_path, cmd)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to send MPV command {cmd}: {exc}") from exc
+        self._ensure_command_worker()
+        wakeup = self._command_wakeup
+        if wakeup is None or self._command_task is None:
+            raise RuntimeError("MPV IPC command queue is unavailable")
+        key = _COALESCED_COMMANDS.get((cmd[0], cmd[1])) if len(cmd) >= 2 else None
+        if key is not None:
+            # Latest value wins; never queue two seeks/speeds/pauses.
+            self._command_pending[key] = list(cmd)
+        else:
+            if self._command_queue is None:
+                self._command_queue = asyncio.Queue()
+            self._command_queue.put_nowait(list(cmd))
+        wakeup.set()
 
     async def close(self) -> None:
         await self.disconnect()

@@ -1527,3 +1527,90 @@ async def test_auto_start_waits_for_every_member_to_be_ready(monkeypatch):
     assert lobby.started is True
     assert len(client.broadcasts) == 1
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_guest_sync_burst_is_coalesced_and_keeps_the_loop_responsive():
+    import nyoanime.ui_watchtogether as ww
+
+    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
+
+    applied = []
+
+    async def slow_apply(payload):
+        await asyncio.sleep(0.03)
+        applied.append(payload["sequence"])
+
+    runtime.playback.sync = object()
+    runtime.playback.apply_sync = slow_apply
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        for _ in range(20):
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    for sequence in range(1, 31):
+        runtime._on_sync_playback(
+            {"payload": {"host": True, "sequence": sequence}}
+        )
+    await ticker_task
+    await asyncio.sleep(0.15)
+
+    assert runtime._pending_sync is None
+    assert ticks == 20
+    assert applied
+    assert applied[-1] == 30
+    # One apply in flight, one latest payload waiting; stale updates dropped.
+    assert len(applied) <= 3
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_guest_leave_timeout_exits_instead_of_freezing(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+
+    class DummyLive:
+        def __init__(self, *args, **kwargs):
+            self.renders = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def update(self, renderable, refresh=False):
+            self.renders += 1
+
+    class DummyRaw:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ww, "RawTerminal", DummyRaw)
+    monkeypatch.setattr(ww, "Live", DummyLive)
+    monkeypatch.setattr(ww, "_LEAVE_TIMEOUT_SECONDS", 0.2)
+    keys = iter(["l"])
+    monkeypatch.setattr(ww, "get_key", lambda: next(keys, None))
+
+    client = FakeClient(role="guest", channels_ready=False)
+
+    async def wedged_leave():
+        await asyncio.sleep(3600)
+
+    client.leave_room = wedged_leave
+    ui = WatchTogetherUI(make_console())
+    monkeypatch.setattr(ui, "_pause", lambda *args, **kwargs: None)
+
+    started = time.monotonic()
+    assert await ui._room_screen(client) is True
+    assert time.monotonic() - started < 2.0

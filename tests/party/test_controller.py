@@ -3,6 +3,7 @@ Unit tests for the Watch Together MPV controller.
 """
 import pytest
 import asyncio
+import time
 from unittest.mock import MagicMock, patch
 from nyoanime.player import PlayerManager
 from nyoanime.party.mpv_controller import MPVController
@@ -63,7 +64,9 @@ async def test_play(controller):
     with patch('nyoanime.player.PlayerManager.send_mpv_command', new_callable=MagicMock) as mock_send:
         mock_send.return_value = None
         await ctrl.play()
-        mock_send.assert_called_once_with('/tmp/fake.sock', ["set_property", "pause", False])
+        await ctrl.flush()
+        mock_send.assert_called_once()
+        assert mock_send.call_args.args[1] == ["set_property", "pause", False]
 @pytest.mark.asyncio
 async def test_pause(controller):
     ctrl, mock_pm = controller
@@ -75,7 +78,9 @@ async def test_pause(controller):
     with patch('nyoanime.player.PlayerManager.send_mpv_command', new_callable=MagicMock) as mock_send:
         mock_send.return_value = None
         await ctrl.pause()
-        mock_send.assert_called_once_with('/tmp/fake.sock', ["set_property", "pause", True])
+        await ctrl.flush()
+        mock_send.assert_called_once()
+        assert mock_send.call_args.args[1] == ["set_property", "pause", True]
 @pytest.mark.asyncio
 async def test_seek_absolute(controller):
     ctrl, mock_pm = controller
@@ -87,7 +92,9 @@ async def test_seek_absolute(controller):
     with patch('nyoanime.player.PlayerManager.send_mpv_command', new_callable=MagicMock) as mock_send:
         mock_send.return_value = None
         await ctrl.seek_absolute(55.5)
-        mock_send.assert_called_once_with('/tmp/fake.sock', ["set_property", "time-pos", 55.5])
+        await ctrl.flush()
+        mock_send.assert_called_once()
+        assert mock_send.call_args.args[1] == ["set_property", "time-pos", 55.5]
 @pytest.mark.asyncio
 async def test_set_speed(controller):
     ctrl, mock_pm = controller
@@ -99,7 +106,9 @@ async def test_set_speed(controller):
     with patch('nyoanime.player.PlayerManager.send_mpv_command', new_callable=MagicMock) as mock_send:
         mock_send.return_value = None
         await ctrl.set_speed(1.5)
-        mock_send.assert_called_once_with('/tmp/fake.sock', ["set_property", "speed", 1.5])
+        await ctrl.flush()
+        mock_send.assert_called_once()
+        assert mock_send.call_args.args[1] == ["set_property", "speed", 1.5]
 def test_get_position(controller):
     ctrl, mock_pm = controller
     ctrl.session = {
@@ -198,6 +207,7 @@ async def test_set_pause_does_not_echo_its_own_command(controller):
             'nyoanime.player.PlayerManager.send_mpv_command', new_callable=MagicMock
         ) as mock_send:
             await ctrl.set_pause(True)
+            await ctrl.flush()
             assert mock_send.call_args.args[1] == ["set_property", "pause", True]
 
         tracker.state['paused'] = True
@@ -205,3 +215,87 @@ async def test_set_pause_does_not_echo_its_own_command(controller):
         assert changes == []
     finally:
         await ctrl.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_slow_ipc_write_does_not_block_command_callers():
+    from unittest.mock import MagicMock, patch
+
+    ctrl = MPVController(host=False)
+    ctrl.session = {
+        'tracker': MagicMock(state={'time_pos': 0.0, 'duration': 100.0, 'paused': False}),
+        'sock_path': '/tmp/fake.sock',
+        'process': MagicMock(),
+    }
+    sent = []
+
+    def slow_write(sock_path, command, request_id=None, timeout=1.5):
+        sent.append(command)
+        time.sleep(0.4)
+        return None
+
+    with patch('nyoanime.player.PlayerManager.send_mpv_command', side_effect=slow_write):
+        started = time.monotonic()
+        await asyncio.wait_for(ctrl.seek_absolute(12.5), timeout=0.1)
+        enqueue_time = time.monotonic() - started
+        await ctrl.flush(timeout=2.0)
+        total_time = time.monotonic() - started
+
+    assert sent == [["set_property", "time-pos", 12.5]]
+    assert enqueue_time < 0.1
+    assert total_time >= 0.35
+
+
+@pytest.mark.asyncio
+async def test_rapid_updates_coalesce_to_the_latest_value():
+    from unittest.mock import MagicMock, patch
+
+    ctrl = MPVController(host=False)
+    ctrl.session = {
+        'tracker': MagicMock(state={'time_pos': 0.0, 'duration': 100.0, 'paused': False}),
+        'sock_path': '/tmp/fake.sock',
+        'process': MagicMock(),
+    }
+    sent = []
+
+    def write(sock_path, command, request_id=None, timeout=1.5):
+        sent.append(command)
+        time.sleep(0.02)
+        return None
+
+    with patch('nyoanime.player.PlayerManager.send_mpv_command', side_effect=write):
+        for position in range(30):
+            await ctrl.seek_absolute(float(position))
+        await ctrl.flush(timeout=2.0)
+
+    assert sent
+    assert sent[-1] == ["set_property", "time-pos", 29.0]
+    assert len(sent) <= 2
+
+
+@pytest.mark.asyncio
+async def test_failed_ipc_write_is_dropped_and_the_worker_survives():
+    from unittest.mock import MagicMock, patch
+
+    ctrl = MPVController(host=False)
+    ctrl.session = {
+        'tracker': MagicMock(state={'time_pos': 0.0, 'duration': 100.0, 'paused': False}),
+        'sock_path': '/tmp/fake.sock',
+        'process': MagicMock(),
+    }
+    calls = []
+
+    def flaky_write(sock_path, command, request_id=None, timeout=1.5):
+        calls.append(command)
+        if command[:2] == ["set_property", "speed"]:
+            raise RuntimeError("socket went away")
+        return None
+
+    with patch('nyoanime.player.PlayerManager.send_mpv_command', side_effect=flaky_write):
+        await ctrl.set_speed(1.2)
+        await ctrl.flush(timeout=2.0)
+        await ctrl.pause()
+        await ctrl.flush(timeout=2.0)
+
+    assert ["set_property", "speed", 1.2] in calls
+    assert ["set_property", "pause", True] in calls
