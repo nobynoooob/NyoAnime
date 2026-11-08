@@ -15,6 +15,8 @@ class PartyEvent(str, Enum):
     PAUSE = "pause"
     SEEK = "seek"
     EPISODE_CHANGED = "episode_changed"
+    LOBBY_STATE = "lobby_state"
+    LOBBY_READY = "lobby_ready"
     READY = "ready"
     BUFFERING = "buffering"
     CHAT = "chat"

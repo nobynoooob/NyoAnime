@@ -571,6 +571,7 @@ class SupabaseTransport(RealtimeTransport):
         PartyEvent.SEEK.value,
         PartyEvent.SYNC_PLAYBACK.value,
         PartyEvent.EPISODE_CHANGED.value,
+        PartyEvent.LOBBY_STATE.value,
         PartyEvent.ROOM_STATE.value,
         PartyEvent.END_ROOM.value,
         PartyEvent.LOCK_ROOM.value,

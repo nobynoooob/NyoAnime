@@ -1,6 +1,7 @@
 """Regression tests for the redesigned Watch Together screens."""
 import asyncio
 import io
+import time
 
 import pytest
 from rich.console import Console
@@ -1007,13 +1008,17 @@ def _playback_payload(url="https://cdn.example.test/episode.m3u8"):
 
 
 @pytest.mark.asyncio
-async def test_host_play_from_menu_broadcasts_and_starts_room_mpv(monkeypatch):
+async def test_host_play_from_menu_opens_a_lobby_before_starting_mpv(monkeypatch):
     import nyoanime.ui_watchtogether as ww
+
+    async def no_probe(reference, **kwargs):
+        return []
 
     _FakeMPV.instances.clear()
     _FakeSync.instances.clear()
     monkeypatch.setattr(ww, "MPVController", _FakeMPV)
     monkeypatch.setattr(ww, "SyncEngine", _FakeSync)
+    monkeypatch.setattr(ww, "discover_options", no_probe)
 
     client = FakeClient(role="host", channels_ready=True, nickname="Alice")
     selection = {
@@ -1026,6 +1031,16 @@ async def test_host_play_from_menu_broadcasts_and_starts_room_mpv(monkeypatch):
     ui = WatchTogetherUI(make_console())
     runtime = ww._RoomRuntime(ui, client)
     await runtime.start()
+    runtime.state = {
+        "participants": [
+            {"id": PARTICIPANT_ID, "nickname": "Alice", "role": "host"},
+        ],
+        "you": {
+            "participant_id": PARTICIPANT_ID,
+            "nickname": "Alice",
+            "role": "host",
+        },
+    }
 
     playback = ui._playback_from_selection(selection)
     reference = ui._selection_reference(selection)
@@ -1034,18 +1049,29 @@ async def test_host_play_from_menu_broadcasts_and_starts_room_mpv(monkeypatch):
 
     assert len(client.events) == 1
     event, payload = client.events[0]
-    assert event == "episode_changed"
+    assert event == "lobby_state"
     assert payload["anime_reference"]["episode_number"] == "3"
-    assert payload["playback"]["url"] == "https://cdn.example.test/episode.m3u8"
-    assert payload["playback"]["headers"]["Referer"] == "https://provider.example.test/"
-    assert "Cookie" not in payload["playback"]["headers"]
-    assert payload["stream_url"] == "https://cdn.example.test/episode.m3u8"
-    assert payload["episode_number"] == "3"
+    assert "playback" not in payload
+    assert "stream_url" not in payload
+    assert runtime.lobby is not None
+    assert runtime.lobby.reference["episode_number"] == "3"
+    assert [option.mode for option in runtime.lobby.options] == ["en_sub"]
+    assert _FakeMPV.instances == []
+
+    await runtime.confirm_lobby_choice()
+    for _ in range(4):
+        await asyncio.sleep(0)
+
     assert len(client.broadcasts) == 1
     broadcast_playback, broadcast_reference = client.broadcasts[0]
     assert broadcast_playback["url"] == "https://cdn.example.test/episode.m3u8"
     assert "Cookie" not in broadcast_playback["headers"]
     assert broadcast_reference["episode_number"] == "3"
+    assert [event for event, _ in client.events] == [
+        "lobby_state",
+        "lobby_ready",
+        "episode_changed",
+    ]
 
     assert len(_FakeMPV.instances) == 1
     mpv = _FakeMPV.instances[0]
@@ -1148,10 +1174,9 @@ async def test_mpv_launch_failure_becomes_a_notice(monkeypatch):
     runtime = ww._RoomRuntime(ui, client)
     await runtime.start()
 
-    await runtime.play_episode(
-        ui._playback_from_selection(selection),
-        ui._selection_reference(selection),
-    )
+    playback = ui._playback_from_selection(selection)
+    reference = ui._selection_reference(selection)
+    runtime.queue_playback(playback, reference)
     await asyncio.sleep(0)
     await runtime._tick()
 
@@ -1254,3 +1279,251 @@ def test_app_browse_resolves_a_direct_stream_for_watch_together(monkeypatch):
     assert selection["playback"]["headers"]["Referer"] == "https://provider.example/"
     assert selection["playback"]["subtitle_url"] == "https://cdn.example/frieren-3.vtt"
     assert selection["playback_error"] is None
+
+
+def _lobby_option(mode, provider="hianime", url="https://cdn.example/sub.m3u8", title="Frieren - Ep 3"):
+    from nyoanime.party.lobby import LobbyOption
+
+    return LobbyOption(
+        mode=mode,
+        provider_id=provider,
+        playback={"url": url, "title": title, "episode_number": "3"},
+    )
+
+
+def _host_lobby(ready=False, options=None, members=None, deadline=None):
+    from nyoanime.party.lobby import LobbyState
+
+    return LobbyState(
+        reference={
+            "title": "Frieren",
+            "episode_number": "3",
+            "provider_id": "hianime",
+            "language_mode": "en_sub",
+            "anime_type": "TV",
+        },
+        lobby_id="lobby-1",
+        deadline=time.monotonic() + 20.0 if deadline is None else deadline,
+        options=list(options or []),
+        ready=ready,
+        members=dict(members or {}),
+    )
+
+
+def test_lobby_panel_shows_options_and_ready_check(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.lobby import LobbyMember
+
+    client = FakeClient(role="host", channels_ready=True, nickname="Alice")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    first = _lobby_option("en_sub")
+    second = _lobby_option("ar_sub", provider="anime3rb", url="https://cdn.example/ar.m3u8")
+    lobby = _host_lobby(
+        options=[first, second],
+        members={
+            "self": LobbyMember("self", "Alice", role="host", is_you=True, ready=True, mode="en_sub"),
+            "guest": LobbyMember("guest", "Bob", role="guest"),
+        },
+        deadline=time.monotonic() - 1,
+    )
+    lobby.selected = first
+    runtime.lobby = lobby
+
+    model = ui.room_view_model(
+        client,
+        state={
+            "participants": [
+                {"id": PARTICIPANT_ID, "nickname": "Alice", "role": "host"},
+                {"id": OTHER_PARTICIPANT_ID, "nickname": "Bob", "role": "guest"},
+            ],
+            "you": {"participant_id": PARTICIPANT_ID, "nickname": "Alice", "role": "host"},
+        },
+        selection=lobby.reference,
+        lobby=runtime.lobby_model(),
+    )
+    output = render(ui, ui._build_room_panel(model))
+
+    assert "Waiting for all members to select language and get ready" in output
+    assert "[EN SUB]" in output
+    assert "[AR SUB]" in output
+    assert "[✓] Alice" in output
+    assert "[⋯] Bob" in output
+    assert "Selecting..." in output
+    assert "[s] Start Anyway" in output
+
+
+def test_guest_lobby_hides_start_anyway(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.lobby import LobbyMember
+
+    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    lobby = _host_lobby(
+        options=[_lobby_option("en_sub")],
+        members={
+            "host": LobbyMember("host", "Alice", role="host", ready=True, mode="en_sub"),
+            "self": LobbyMember("self", "Bob", role="guest", is_you=True, ready=True, mode="en_sub"),
+        },
+        deadline=time.monotonic() - 1,
+    )
+    lobby.selected = lobby.options[0]
+    lobby.ready = True
+    runtime.lobby = lobby
+
+    model = ui.room_view_model(
+        client,
+        state={
+            "participants": [
+                {"id": OTHER_PARTICIPANT_ID, "nickname": "Alice", "role": "host"},
+                {"id": PARTICIPANT_ID, "nickname": "Bob", "role": "guest"},
+            ],
+            "you": {"participant_id": PARTICIPANT_ID, "nickname": "Bob", "role": "guest"},
+        },
+        selection=lobby.reference,
+        lobby=runtime.lobby_model(),
+    )
+    output = render(ui, ui._build_room_panel(model))
+
+    assert "[s] Start Anyway" not in output
+    assert "You're ready. Waiting for the host" in output
+
+
+@pytest.mark.asyncio
+async def test_guest_start_prefers_its_own_verified_choice(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+
+    _FakeMPV.instances.clear()
+    _FakeSync.instances.clear()
+    monkeypatch.setattr(ww, "MPVController", _FakeMPV)
+    monkeypatch.setattr(ww, "SyncEngine", _FakeSync)
+
+    client = FakeClient(role="guest", channels_ready=True, nickname="Bob")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
+
+    local = _lobby_option(
+        "en_dub",
+        provider="hianime_dub",
+        url="https://cdn.example/dub.m3u8",
+    )
+    lobby = _host_lobby(options=[local])
+    lobby.selected = local
+    lobby.ready = True
+    runtime.lobby = lobby
+
+    runtime._on_episode_changed({
+        "payload": {
+            "anime_reference": lobby.reference,
+            "playback": _playback_payload("https://cdn.example/host-sub.m3u8"),
+        }
+    })
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert lobby.started is True
+    assert len(_FakeMPV.instances) == 1
+    assert (
+        _FakeMPV.instances[0].connected_with["url"]
+        == "https://cdn.example/dub.m3u8"
+    )
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_host_start_anyway_broadcasts_the_english_sub_fallback(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.lobby import LobbyMember
+
+    _FakeMPV.instances.clear()
+    _FakeSync.instances.clear()
+    monkeypatch.setattr(ww, "MPVController", _FakeMPV)
+    monkeypatch.setattr(ww, "SyncEngine", _FakeSync)
+
+    client = FakeClient(role="host", channels_ready=True, nickname="Alice")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
+
+    english = _lobby_option("en_sub", url="https://cdn.example/en-sub.m3u8")
+    arabic = _lobby_option(
+        "ar_sub", provider="anime3rb", url="https://cdn.example/ar-sub.m3u8"
+    )
+    lobby = _host_lobby(
+        options=[english, arabic],
+        members={
+            "self": LobbyMember("self", "Alice", role="host", is_you=True, ready=True, mode="ar_sub"),
+            "guest": LobbyMember("guest", "Bob", role="guest"),
+        },
+        deadline=time.monotonic() - 1,
+    )
+    lobby.selected = arabic
+    lobby.ready = True
+    runtime.lobby = lobby
+
+    assert await runtime.start_lobby(force=True) is True
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert len(client.broadcasts) == 1
+    broadcast_playback, _ = client.broadcasts[0]
+    assert broadcast_playback["url"] == "https://cdn.example/en-sub.m3u8"
+    assert len(_FakeMPV.instances) == 1
+    assert (
+        _FakeMPV.instances[0].connected_with["url"]
+        == "https://cdn.example/ar-sub.m3u8"
+    )
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_auto_start_waits_for_every_member_to_be_ready(monkeypatch):
+    import nyoanime.ui_watchtogether as ww
+    from nyoanime.party.lobby import LobbyMember
+
+    _FakeMPV.instances.clear()
+    _FakeSync.instances.clear()
+    monkeypatch.setattr(ww, "MPVController", _FakeMPV)
+    monkeypatch.setattr(ww, "SyncEngine", _FakeSync)
+
+    client = FakeClient(role="host", channels_ready=True, nickname="Alice")
+    ui = WatchTogetherUI(make_console())
+    runtime = ww._RoomRuntime(ui, client)
+    await runtime.start()
+
+    english = _lobby_option("en_sub")
+    lobby = _host_lobby(
+        options=[english],
+        members={
+            "self": LobbyMember("self", "Alice", role="host", is_you=True, ready=True, mode="en_sub"),
+            "guest": LobbyMember("guest", "Bob", role="guest"),
+        },
+    )
+    lobby.selected = english
+    lobby.ready = True
+    runtime.lobby = lobby
+    runtime._lobby_snapshot_pending = False
+
+    runtime._maybe_auto_start()
+    await asyncio.sleep(0)
+    assert lobby.started is False
+
+    runtime._on_lobby_ready({
+        "payload": {
+            "lobby_id": lobby.lobby_id,
+            "participant_id": "guest",
+            "nickname": "Bob",
+            "role": "guest",
+            "ready": True,
+            "mode": "en_sub",
+            "provider_id": "hianime",
+        }
+    })
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+    assert lobby.started is True
+    assert len(client.broadcasts) == 1
+    await runtime.stop()

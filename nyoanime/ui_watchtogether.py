@@ -46,10 +46,19 @@ from .config import (
     BOUNCING_BAR_FRAMES,
 )
 from .party.client import PartyClientError, WTRClient
+from .party.lobby import (
+    LobbyMember,
+    LobbyOption,
+    LobbyState,
+    allowed_modes,
+    discover_options,
+    preferred_fallback_mode,
+)
 from .party.mpv_controller import MPVController
 from .party.protocol import PartyEvent, sanitize_diagnostic
 from .party.supabase_config import SupabaseConfigError
 from .party.sync import SyncEngine, SyncState
+from .providers.language import language_badge, normalize_language_mode, provider_language_mode
 from .utils import RawTerminal, flush_stdin, get_key
 
 logger = logging.getLogger(__name__)
@@ -81,6 +90,7 @@ _CODE_LEN = 6
 _STATE_REFRESH_SECONDS = 5.0
 _STATUS_POLL_SECONDS = 0.06
 _RECONNECT_RETRY_SECONDS = 4.0
+_LOBBY_DEADLINE_SECONDS = 20.0
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 
@@ -218,6 +228,17 @@ class _RoomRuntime:
         self.next_refresh = time.monotonic() + _STATE_REFRESH_SECONDS
         self.next_retry = time.monotonic() + _RECONNECT_RETRY_SECONDS
 
+        # Lobby state for the current pick. ``option_probe`` is injectable so
+        # tests (and future provider integrations) can bypass network probes.
+        self.lobby: Optional[LobbyState] = None
+        self.option_probe = None
+        self._lobby_task: Optional[asyncio.Task] = None
+        self._lobby_starting = False
+        self._lobby_snapshot_pending = False
+        self._lobby_countdown = None
+        self._pending_lobby_state = False
+        self._pending_lobby_ready = False
+
         self.playback = _RoomPlayback(
             self.role,
             send_callback=self._send_sync,
@@ -232,6 +253,8 @@ class _RoomRuntime:
         if hasattr(self.client, "subscribe"):
             for event, handler in (
                 (PartyEvent.EPISODE_CHANGED.value, self._on_episode_changed),
+                (PartyEvent.LOBBY_STATE.value, self._on_lobby_state),
+                (PartyEvent.LOBBY_READY.value, self._on_lobby_ready),
                 (PartyEvent.ROOM_STATE.value, self._on_room_state),
                 (PartyEvent.SYNC_PLAYBACK.value, self._on_sync_playback),
             ):
@@ -256,9 +279,16 @@ class _RoomRuntime:
             return
         self._stopped = True
         self._closed = True
-        for task in (self._bg_task, self._state_task, self._retry_task, self._playback_task):
+        for task in (
+            self._bg_task,
+            self._state_task,
+            self._retry_task,
+            self._playback_task,
+            self._lobby_task,
+        ):
             await self._cancel_task(task)
-        self._bg_task = self._state_task = self._retry_task = self._playback_task = None
+        self._bg_task = self._state_task = self._retry_task = None
+        self._playback_task = self._lobby_task = None
         await self.playback.stop()
         stop_poll = getattr(self.client, "stop_playback_poll", None)
         if callable(stop_poll):
@@ -331,6 +361,9 @@ class _RoomRuntime:
                     self.notice_until = now + 4.0
             self._state_task = None
             self.next_refresh = now + _STATE_REFRESH_SECONDS
+            if self.lobby is not None and not self.lobby.started:
+                self._seed_lobby_members()
+                self._lobby_snapshot_pending = False
             self._dirty = True
 
         if (
@@ -353,14 +386,29 @@ class _RoomRuntime:
             self._dirty = True
 
         if self._playback_task is not None and self._playback_task.done():
+            failed = False
             try:
                 self._playback_task.result()
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
+                failed = True
                 self.set_notice(self.owner._playback_error_notice(exc))
+                if self.lobby is not None and self.lobby.started:
+                    # Let the host retry (or [s] again) instead of stranding
+                    # the lobby on a failed player launch.
+                    self.lobby.started = False
+                    self._lobby_starting = False
             self._playback_task = None
             self.busy = ""
+            if (
+                not failed
+                and self.lobby is not None
+                and self.lobby.started
+                and self.playback.active
+            ):
+                # Playback is running; the lobby has done its job.
+                self.lobby = None
             self._dirty = True
 
         ready_now = bool(getattr(self.client, "channels_ready", False))
@@ -376,7 +424,16 @@ class _RoomRuntime:
             )
             self.next_retry = now + _RECONNECT_RETRY_SECONDS
 
-        if self.busy or not ready_now:
+        lobby = self.lobby
+        if lobby is not None and not lobby.started:
+            self.spinner_frame = int(now * 9)
+            countdown = int(lobby.remaining(now) + 0.999)
+            if countdown != self._lobby_countdown:
+                self._lobby_countdown = countdown
+                self._dirty = True
+            if self.role == "host":
+                self._maybe_auto_start()
+        elif self.busy or not ready_now:
             self.spinner_frame = int(now * 9)
 
         if getattr(self.client, "channels_ready", False) and self.error:
@@ -384,10 +441,17 @@ class _RoomRuntime:
             self.technical = getattr(self.client, "channel_error", None) or self.technical
             self.set_notice("Connected again.")
 
-        if ready_now and not self.was_ready and self.pending_share:
-            await self.share_selection()
-        elif ready_now and not self.was_ready and not self.notice:
-            self.set_notice("Connected again.")
+        if ready_now and not self.was_ready:
+            if self.pending_share:
+                await self.share_selection()
+            if self._pending_lobby_state and lobby is not None and self.role == "host":
+                self._pending_lobby_state = False
+                await self._broadcast_lobby_state()
+            if self._pending_lobby_ready and lobby is not None and lobby.ready:
+                self._pending_lobby_ready = False
+                await self._broadcast_lobby_ready()
+            if not self.notice:
+                self.set_notice("Connected again.")
         self.was_ready = ready_now
         self._update_status()
 
@@ -411,6 +475,10 @@ class _RoomRuntime:
         self.selected_reference = reference
         incoming_playback = self.owner._playback_from_message(message)
         if str(getattr(self.client, "role", "guest") or "guest").lower() != "host":
+            lobby = self.lobby
+            if lobby is not None and not lobby.started:
+                self._apply_lobby_start(lobby, incoming_playback, reference)
+                return
             self.set_notice(f"Host picked: {self.owner._selection_label(reference)}")
             if incoming_playback:
                 self.selected_playback = incoming_playback
@@ -421,6 +489,30 @@ class _RoomRuntime:
         else:
             if incoming_playback:
                 self.selected_playback = incoming_playback
+        self._dirty = True
+
+    def _apply_lobby_start(
+        self,
+        lobby: LobbyState,
+        incoming_playback: Optional[Dict[str, Any]],
+        reference: Dict[str, Any],
+    ) -> None:
+        """The host started: use this member's verified pick when it has one."""
+        lobby.started = True
+        local = lobby.selected or lobby.fallback
+        playback = (local.playback if local is not None else None) or incoming_playback
+        if local is not None:
+            self.selected_playback = local.playback
+        elif incoming_playback:
+            self.selected_playback = incoming_playback
+        if playback:
+            self.queue_playback(playback, lobby.reference or reference)
+            mode = local.mode_label if local is not None else "host stream"
+            self.set_notice(f"Starting with {mode}.")
+        else:
+            self.selected_playback = None
+            self.set_notice("The host started, but no stream was available.")
+            self._spawn(self._stop_guest_playback())
         self._dirty = True
 
     async def _stop_guest_playback(self) -> None:
@@ -444,6 +536,458 @@ class _RoomRuntime:
         if reference and reference != self.selected_reference:
             self.selected_reference = reference
             self._dirty = True
+
+    # ------------------------------------------------------------------
+    # Lobby
+    # ------------------------------------------------------------------
+    def _self_key(self) -> str:
+        return str(
+            getattr(self.client, "participant_id", None)
+            or getattr(self.client, "nickname", None)
+            or "you"
+        )
+
+    def _state_participants(self) -> List[Dict[str, Any]]:
+        state = self.state if isinstance(self.state, dict) else {}
+        raw = state.get("participants")
+        if isinstance(raw, list):
+            return [row for row in raw if isinstance(row, dict)]
+        if isinstance(raw, dict):
+            return [row for row in raw.values() if isinstance(row, dict)]
+        return []
+
+    def _seed_lobby_members(self) -> None:
+        lobby = self.lobby
+        if lobby is None or lobby.started:
+            return
+        state = self.state if isinstance(self.state, dict) else {}
+        you = state.get("you") if isinstance(state.get("you"), dict) else {}
+        you_pid = str(
+            you.get("participant_id")
+            or getattr(self.client, "participant_id", None)
+            or ""
+        )
+        you_name = str(
+            you.get("nickname") or getattr(self.client, "nickname", None) or "You"
+        )
+        for row in self._state_participants():
+            key = str(
+                row.get("id")
+                or row.get("participant_id")
+                or row.get("user_id")
+                or row.get("nickname")
+                or ""
+            )
+            if not key:
+                continue
+            name = str(row.get("nickname") or row.get("name") or "Guest")
+            role = str(row.get("role") or "guest").lower()
+            if role not in ("host", "guest"):
+                role = "guest"
+            is_you = bool(
+                (you_pid and key == you_pid)
+                or (not you_pid and name == you_name)
+            )
+            member = lobby.members.get(key)
+            if member is None:
+                lobby.members[key] = LobbyMember(
+                    key=key,
+                    name=name,
+                    role=role,
+                    is_you=is_you,
+                )
+                continue
+            member.name = name
+            member.role = role
+            member.is_you = member.is_you or is_you
+        self._register_self_lobby_member()
+
+    def _register_self_lobby_member(self) -> None:
+        lobby = self.lobby
+        if lobby is None:
+            return
+        key = self._self_key()
+        name = str(getattr(self.client, "nickname", None) or "You")
+        member = lobby.members.get(key)
+        if member is None:
+            member = LobbyMember(key=key, name=name, role=self.role, is_you=True)
+            lobby.members[key] = member
+        member.name = name
+        member.role = self.role
+        member.is_you = True
+
+    def _on_lobby_state(self, message: Any) -> None:
+        if self.role == "host":
+            # The sender never receives its own broadcast; a second host
+            # broadcast in a guest's seat is stale or malicious.
+            return
+        payload = (
+            message.get("payload")
+            if isinstance(message, dict)
+            else getattr(message, "payload", None)
+        )
+        if not isinstance(payload, dict):
+            return
+        reference = self.owner._reference_from_message(message)
+        if not reference:
+            return
+        lobby_id = str(payload.get("lobby_id") or "")
+        current = self.lobby
+        if current is not None and current.lobby_id == lobby_id:
+            return
+        remaining = _LOBBY_DEADLINE_SECONDS
+        deadline_ms = payload.get("deadline_ms")
+        if deadline_ms not in (None, ""):
+            try:
+                remaining = (
+                    int(deadline_ms) - int(time.time() * 1000)
+                ) / 1000.0
+            except (TypeError, ValueError):
+                remaining = _LOBBY_DEADLINE_SECONDS
+        remaining = min(max(remaining, 0.0), 60.0)
+        self._spawn(
+            self.begin_lobby(
+                None,
+                reference,
+                broadcast=False,
+                lobby_id=lobby_id or None,
+                deadline_seconds=remaining,
+            )
+        )
+
+    def _on_lobby_ready(self, message: Any) -> None:
+        payload = (
+            message.get("payload")
+            if isinstance(message, dict)
+            else getattr(message, "payload", None)
+        )
+        if not isinstance(payload, dict):
+            return
+        lobby = self.lobby
+        if lobby is None or lobby.started:
+            return
+        lobby_id = str(payload.get("lobby_id") or "")
+        if lobby_id and lobby_id != lobby.lobby_id:
+            return
+        key = str(
+            payload.get("participant_id")
+            or payload.get("nickname")
+            or ""
+        )
+        if not key:
+            return
+        name = str(payload.get("nickname") or "Guest")
+        role = str(payload.get("role") or "guest").lower()
+        if role not in ("host", "guest"):
+            role = "guest"
+        member = lobby.members.get(key)
+        if member is None:
+            member = LobbyMember(key=key, name=name, role=role)
+            lobby.members[key] = member
+        member.name = name
+        member.role = role
+        member.ready = bool(payload.get("ready"))
+        member.mode = str(payload.get("mode") or "") if member.ready else ""
+        member.is_you = key == self._self_key() or member.is_you
+        self._dirty = True
+        if self.role == "host":
+            self._maybe_auto_start()
+
+    async def begin_lobby(
+        self,
+        playback: Optional[Dict[str, Any]],
+        reference: Optional[Dict[str, Any]],
+        *,
+        broadcast: bool = True,
+        lobby_id: Optional[str] = None,
+        deadline_seconds: Optional[float] = None,
+    ) -> None:
+        reference = self.owner._clean_reference(reference)
+        if not reference:
+            self.set_notice("Couldn't open the lobby without an episode.")
+            return
+        if self.playback.active:
+            await self.playback.stop()
+        self.selected_reference = reference
+        self.selected_playback = playback if isinstance(playback, dict) else None
+
+        seed_mode = ""
+        language_mode = str(reference.get("language_mode") or "")
+        if language_mode:
+            seed_mode = normalize_language_mode(language_mode)
+        elif reference.get("provider_id"):
+            seed_mode = provider_language_mode(reference.get("provider_id"))
+        seed_playback = (
+            dict(playback)
+            if isinstance(playback, dict) and playback.get("url")
+            else None
+        )
+        identity = (
+            reference.get("anime_id")
+            or reference.get("title")
+            or "episode"
+        )
+        lobby = LobbyState(
+            reference=reference,
+            lobby_id=lobby_id
+            or f"{identity}:{reference.get('episode_number', '')}:{int(time.time() * 1000)}",
+            deadline=time.monotonic()
+            + max(
+                0.0,
+                _LOBBY_DEADLINE_SECONDS
+                if deadline_seconds is None
+                else float(deadline_seconds),
+            ),
+            seed_mode=seed_mode,
+            seed_playback=seed_playback,
+        )
+        if seed_playback and seed_mode:
+            seed_option = lobby.seed_option
+            if seed_option is not None:
+                lobby.options = [seed_option]
+                lobby.selected = seed_option
+                lobby.choice_index = 0
+        self.lobby = lobby
+        self._lobby_starting = False
+        self._lobby_countdown = int(lobby.remaining() + 0.999)
+        self._register_self_lobby_member()
+        self._seed_lobby_members()
+        self._lobby_snapshot_pending = not bool(self._state_participants())
+        self._dirty = True
+
+        ready_now = bool(getattr(self.client, "channels_ready", False))
+        if (
+            ready_now
+            and self._state_task is None
+            and getattr(self.client, "room_active", False)
+        ):
+            self._state_task = self._loop.create_task(self.client.get_room_state())
+            self.next_refresh = time.monotonic() + _STATE_REFRESH_SECONDS
+
+        if broadcast and self.role == "host":
+            await self._broadcast_lobby_state()
+        self._start_lobby_discovery()
+        self.set_notice(
+            "Choose your language, then press Enter to get ready."
+        )
+
+    async def _broadcast_lobby_state(self) -> None:
+        lobby = self.lobby
+        if lobby is None or lobby.started or self.role != "host":
+            return
+        if not getattr(self.client, "channels_ready", False):
+            self._pending_lobby_state = True
+            return
+        reference = lobby.reference
+        payload: Dict[str, Any] = {
+            "lobby_id": lobby.lobby_id,
+            "anime_reference": reference,
+            "deadline_ms": int(
+                time.time() * 1000 + lobby.remaining() * 1000
+            ),
+            "deadline_seconds": int(lobby.remaining() + 0.999),
+            "fallback_mode": preferred_fallback_mode(
+                reference.get("anime_type"),
+                [mode for mode in allowed_modes(reference.get("anime_type"))],
+            ),
+            "host_mode": lobby.seed_mode,
+        }
+        try:
+            await self.client.send_event(PartyEvent.LOBBY_STATE.value, payload)
+            self._pending_lobby_state = False
+        except Exception as exc:
+            self._pending_lobby_state = True
+            logger.warning("Watch Together lobby broadcast failed: %s", exc)
+            self.set_notice("Couldn't share the lobby yet. Retrying when connected.")
+
+    async def _broadcast_lobby_ready(self) -> None:
+        lobby = self.lobby
+        if lobby is None:
+            return
+        option = lobby.selected if lobby.ready else None
+        payload: Dict[str, Any] = {
+            "lobby_id": lobby.lobby_id,
+            "participant_id": self._self_key(),
+            "nickname": str(getattr(self.client, "nickname", "") or "You"),
+            "role": self.role,
+            "ready": bool(lobby.ready and option is not None),
+            "mode": option.mode if option is not None else "",
+            "provider_id": option.provider_id if option is not None else "",
+        }
+        if not getattr(self.client, "channels_ready", False):
+            self._pending_lobby_ready = True
+            return
+        try:
+            await self.client.send_event(PartyEvent.LOBBY_READY.value, payload)
+            self._pending_lobby_ready = False
+        except Exception as exc:
+            self._pending_lobby_ready = True
+            logger.warning("Watch Together readiness broadcast failed: %s", exc)
+
+    def _start_lobby_discovery(self) -> None:
+        lobby = self.lobby
+        if lobby is None:
+            return
+        if self._lobby_task is not None and not self._lobby_task.done():
+            self._lobby_task.cancel()
+        self._lobby_task = self._loop.create_task(
+            self._discover_lobby_options(lobby)
+        )
+
+    async def _discover_lobby_options(self, lobby: LobbyState) -> None:
+        try:
+            options = await discover_options(
+                lobby.reference,
+                probe=self.option_probe,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Watch Together lobby probe failed", exc_info=True)
+            options = []
+        if self.lobby is not lobby or lobby.started:
+            return
+        seed = lobby.seed_option
+        merged: List[LobbyOption] = []
+        if seed is not None:
+            merged.append(seed)
+        for option in options:
+            if seed is not None and option.mode == seed.mode:
+                continue
+            merged.append(option)
+        lobby.options = merged
+        lobby.discovering = False
+        previous = lobby.selected
+        match = next(
+            (option for option in merged if option == previous), None
+        ) if previous is not None else None
+        # Keep the host's seed pick pointing at the merged object so identity
+        # checks (selection marker, arrow re-selection) stay consistent.
+        lobby.selected = match
+        if previous is not None and match is None:
+            lobby.ready = False
+        lobby.choice_index = min(
+            lobby.choice_index, max(0, len(merged) - 1)
+        )
+        if not merged:
+            lobby.error = "No playable stream was verified for this episode."
+            self.set_notice("No playable stream was verified for this episode.")
+        else:
+            lobby.error = ""
+            self.set_notice(
+                f"{len(merged)} language option"
+                f"{'' if len(merged) == 1 else 's'} verified."
+            )
+        self._dirty = True
+
+    def move_lobby_choice(self, delta: int) -> None:
+        lobby = self.lobby
+        if lobby is None or lobby.started or not lobby.options:
+            return
+        lobby.choice_index = (
+            lobby.choice_index + int(delta)
+        ) % len(lobby.options)
+        highlighted = lobby.options[lobby.choice_index]
+        if lobby.ready and highlighted is not lobby.selected:
+            lobby.ready = False
+            member = lobby.members.get(self._self_key())
+            if member is not None:
+                member.ready = False
+                member.mode = ""
+            self._spawn(self._broadcast_lobby_ready())
+        self._dirty = True
+
+    async def confirm_lobby_choice(self) -> None:
+        lobby = self.lobby
+        if lobby is None or lobby.started:
+            return
+        if not lobby.options:
+            self.set_notice(
+                "Still checking for playable streams..."
+                if lobby.discovering
+                else "No playable stream was verified for this episode."
+            )
+            return
+        lobby.choice_index %= len(lobby.options)
+        option = lobby.options[lobby.choice_index]
+        lobby.selected = option
+        lobby.ready = True
+        self.selected_playback = option.playback
+        member = lobby.members.get(self._self_key())
+        if member is not None:
+            member.ready = True
+            member.mode = option.mode
+        await self._broadcast_lobby_ready()
+        self.set_notice(f"Ready: {option.label}.")
+        self._dirty = True
+        if self.role == "host":
+            self._maybe_auto_start()
+
+    def _maybe_auto_start(self) -> None:
+        if self.role != "host":
+            return
+        lobby = self.lobby
+        if lobby is None or lobby.started or self._lobby_starting:
+            return
+        if self._lobby_snapshot_pending or not lobby.all_ready:
+            return
+        self._lobby_starting = True
+        self._spawn(self._host_start())
+
+    async def start_lobby(self, force: bool = False) -> bool:
+        lobby = self.lobby
+        if self.role != "host" or lobby is None or lobby.started:
+            return False
+        if not force and not lobby.can_start_anyway():
+            return False
+        return await self._host_start()
+
+    async def _host_start(self) -> bool:
+        lobby = self.lobby
+        self._lobby_starting = False
+        if lobby is None or lobby.started or self.role != "host":
+            return False
+        fallback = lobby.fallback
+        local = lobby.selected or fallback
+        playback = local.playback if local is not None else None
+        if not playback:
+            self.set_notice(
+                "No playable stream was verified. Try another episode."
+            )
+            return False
+        lobby.started = True
+        self._dirty = True
+        if self._lobby_task is not None and not self._lobby_task.done():
+            self._lobby_task.cancel()
+        self._lobby_task = None
+
+        # Unready members get the room fallback (English sub first), not the
+        # host's personal choice.
+        broadcast = fallback or local
+        if broadcast is not None:
+            safe_playback = self.owner._broadcast_playback(broadcast.playback)
+            broadcaster = getattr(self.client, "broadcast_playback", None)
+            try:
+                if callable(broadcaster) and safe_playback:
+                    await broadcaster(safe_playback, lobby.reference)
+                else:
+                    await self.client.send_event(
+                        PartyEvent.EPISODE_CHANGED.value,
+                        {
+                            "anime_reference": lobby.reference,
+                            "playback": safe_playback or broadcast.playback,
+                        },
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Watch Together lobby start broadcast failed: %s", exc
+                )
+                self.set_notice(
+                    "Starting locally, but guests may not have received the stream."
+                )
+        self.selected_playback = playback
+        self.queue_playback(playback, lobby.reference)
+        return True
 
     async def _send_sync(self, payload: Dict[str, Any]) -> None:
         await self.client.send_event(PartyEvent.SYNC_PLAYBACK.value, payload)
@@ -479,12 +1023,15 @@ class _RoomRuntime:
         playback: Dict[str, Any],
         reference: Dict[str, Any],
     ) -> None:
-        """Host a stream picked from the normal anime menus."""
+        """Host a stream picked from the normal anime menus.
+
+        The pick opens a lobby first; MPV starts only after the host confirms
+        their own language (or overrides the ready check).
+        """
         self.selected_reference = reference
         self.selected_playback = playback
         self._dirty = True
-        await self.share_selection()
-        self.queue_playback(playback, reference)
+        await self.begin_lobby(playback, reference, broadcast=self.role == "host")
 
     async def share_selection(self) -> bool:
         reference = self.selected_reference
@@ -550,6 +1097,79 @@ class _RoomRuntime:
     # ------------------------------------------------------------------
     # View
     # ------------------------------------------------------------------
+    def lobby_model(self) -> Optional[Dict[str, Any]]:
+        lobby = self.lobby
+        if lobby is None:
+            return None
+        now = time.monotonic()
+        options = []
+        for index, option in enumerate(lobby.options):
+            options.append({
+                "index": index,
+                "mode": option.mode,
+                "badge": language_badge(option.mode),
+                "label": option.mode_label,
+                "provider": option.provider_name,
+                "highlighted": index == lobby.choice_index,
+                "selected": option is lobby.selected,
+            })
+        members = []
+        for member in lobby.members.values():
+            members.append({
+                "key": member.key,
+                "name": member.name,
+                "role": member.role,
+                "is_you": member.is_you,
+                "is_host": member.role == "host",
+                "ready": member.ready,
+                "mode": member.mode,
+                "mode_label": member.mode_label,
+                "marker": "✓" if member.ready else "⋯",
+            })
+        members.sort(key=lambda row: (
+            0 if row["is_host"] else 1,
+            0 if row["is_you"] else 1,
+            row["name"].lower(),
+        ))
+        remaining = lobby.remaining(now)
+        can_start = bool(
+            self.role == "host"
+            and not lobby.started
+            and not self._lobby_snapshot_pending
+            and lobby.can_start_anyway(now)
+        )
+        if lobby.started:
+            status = "Starting playback on every player..."
+        elif self.role == "host" and lobby.all_ready:
+            status = "Everyone is ready. Starting..."
+        elif self.role == "host":
+            status = (
+                "Waiting for all members to select language and get ready..."
+            )
+        elif lobby.ready:
+            status = "You're ready. Waiting for the host to start..."
+        elif lobby.discovering and not lobby.options:
+            status = "Checking which streams work for this episode..."
+        else:
+            status = "Choose your language, then press Enter to get ready."
+        return {
+            "id": lobby.lobby_id,
+            "title": lobby.reference.get("title", ""),
+            "episode": lobby.reference.get("episode_number", ""),
+            "episode_title": lobby.reference.get("episode_title", ""),
+            "options": options,
+            "members": members,
+            "discovering": lobby.discovering,
+            "ready": lobby.ready,
+            "started": lobby.started,
+            "error": lobby.error,
+            "remaining": int(remaining + 0.999),
+            "all_ready": lobby.all_ready,
+            "can_start_anyway": can_start,
+            "is_host": self.role == "host",
+            "status": status,
+        }
+
     def view_model(self, busy_override: str = "") -> Dict[str, Any]:
         return self.owner.room_view_model(
             self.client,
@@ -563,6 +1183,7 @@ class _RoomRuntime:
             busy=busy_override or self.busy,
             selection=self.selected_reference,
             spinner_frame=self.spinner_frame,
+            lobby=self.lobby_model(),
         )
 
     def _view(self, busy_override: str = ""):
@@ -583,6 +1204,30 @@ class _RoomRuntime:
             len((self.state or {}).get("participants") or []),
             self.selected_reference,
             self.spinner_frame,
+            self._lobby_signature(),
+        )
+
+    def _lobby_signature(self) -> Optional[Tuple]:
+        lobby = self.lobby
+        if lobby is None:
+            return None
+        return (
+            lobby.lobby_id,
+            lobby.discovering,
+            lobby.ready,
+            lobby.choice_index,
+            lobby.started,
+            lobby.error,
+            tuple(
+                (option.mode, option.provider_id)
+                for option in lobby.options
+            ),
+            tuple(sorted(
+                (key, member.ready, member.mode)
+                for key, member in lobby.members.items()
+            )),
+            int(lobby.remaining() + 0.999),
+            self._lobby_snapshot_pending,
         )
 
     async def run_ui(self) -> bool:
@@ -651,6 +1296,41 @@ class _RoomRuntime:
                             # stays hosted while the main menu is in use.
                             break
 
+                        elif (
+                            self.lobby is not None
+                            and not self.lobby.started
+                            and key in ("UP", "k", "K")
+                        ):
+                            self.move_lobby_choice(-1)
+
+                        elif (
+                            self.lobby is not None
+                            and not self.lobby.started
+                            and key in ("DOWN", "j", "J")
+                        ):
+                            self.move_lobby_choice(1)
+
+                        elif (
+                            self.lobby is not None
+                            and not self.lobby.started
+                            and key == "ENTER"
+                        ):
+                            self._spawn(self.confirm_lobby_choice())
+
+                        elif (
+                            key in ("s", "S")
+                            and self.lobby is not None
+                            and not self.lobby.started
+                            and self.role == "host"
+                        ):
+                            if self.lobby.can_start_anyway():
+                                self._spawn(self.start_lobby())
+                            else:
+                                self.set_notice(
+                                    "Start Anyway unlocks when everyone is ready "
+                                    f"or in {max(1, int(self.lobby.remaining() + 0.999))}s."
+                                )
+
                         elif key in ("r", "R"):
                             if getattr(self.client, "channels_ready", False):
                                 if self._state_task is None:
@@ -690,15 +1370,21 @@ class _RoomRuntime:
                                 self.show_diagnostics = False
                                 self._dirty = True
                             else:
-                                hint = (
-                                    "Press [l] to leave, [i] for details, "
-                                    "or [q] to quit."
-                                )
-                                if self.role == "host":
+                                if self.lobby is not None and not self.lobby.started:
                                     hint = (
-                                        "Press [b] for the main menu, [l] to leave, "
-                                        "[i] for details, or [q] to quit."
+                                        "Use Up/Down to choose a language, then "
+                                        "press Enter to get ready."
                                     )
+                                else:
+                                    hint = (
+                                        "Press [l] to leave, [i] for details, "
+                                        "or [q] to quit."
+                                    )
+                                    if self.role == "host":
+                                        hint = (
+                                            "Press [b] for the main menu, [l] to leave, "
+                                            "[i] for details, or [q] to quit."
+                                        )
                                 self.set_notice(hint)
 
                         await asyncio.sleep(_STATUS_POLL_SECONDS)
@@ -1005,11 +1691,18 @@ class WatchTogetherUI:
         playback: Dict[str, Any],
         reference: Dict[str, Any],
     ) -> bool:
-        """Link a main-menu episode to the room (host only)."""
+        """Link a main-menu episode to the room (host only).
+
+        Opens the lobby immediately: the host has to pick a language and get
+        ready just like everyone else before playback can start.
+        """
         session = self._session
         if session is None:
             return False
-        return session.play_episode(playback, reference)
+        if not session.play_episode(playback, reference):
+            return False
+        self._open_room()
+        return True
 
     def shutdown(self) -> None:
         with self._session_lock:
@@ -1649,6 +2342,7 @@ class WatchTogetherUI:
         busy: str = "",
         selection: Optional[Dict[str, Any]] = None,
         spinner_frame: int = 0,
+        lobby: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         role = str(getattr(client, "role", "guest") or "guest").lower()
         role_label = "HOST" if role == "host" else "GUEST"
@@ -1758,6 +2452,7 @@ class WatchTogetherUI:
             "selection_title": chosen_title,
             "selection_episode": chosen_episode,
             "selection_episode_title": chosen_episode_title,
+            "lobby": lobby,
         }
 
     def _participant_rows(
@@ -2000,6 +2695,10 @@ class WatchTogetherUI:
 
         if show_diagnostics:
             content.add_row(self._diagnostics_view(model, inner_width))
+        elif model.get("lobby"):
+            content.add_row(
+                self._lobby_view(model, model["lobby"], inner_width, compact=compact)
+            )
         else:
             content.add_row(
                 self._members_view(model, inner_width, compact=compact)
@@ -2034,6 +2733,122 @@ class WatchTogetherUI:
             padding=(0, 2) if self.console.height < 32 else (1, 2),
             width=box_width,
         )
+
+    def _lobby_view(
+        self,
+        model: Dict[str, Any],
+        lobby: Dict[str, Any],
+        width: int,
+        compact: bool = False,
+    ) -> Table:
+        table = Table.grid(expand=True)
+        table.add_column(justify="left")
+
+        header = Text()
+        header.append("LOBBY", style=f"bold {COLOR_SUBTITLE}")
+        if lobby["discovering"]:
+            header.append("   ")
+            header.append(
+                f"{model.get('spinner', '◌')} checking streams…",
+                style=f"bold {COLOR_TITLE}",
+            )
+        table.add_row(header)
+        table.add_row(Text(lobby["status"], style="bold white"))
+
+        if lobby["started"]:
+            table.add_row(Text(""))
+            return table
+
+        options = lobby["options"]
+        if not options and lobby["discovering"]:
+            table.add_row(Text(
+                "Looking for playable streams on this device...",
+                style=f"dim {COLOR_SECONDARY_TEXT}",
+            ))
+        elif not options:
+            table.add_row(Text(
+                "No playable stream was verified for this episode.",
+                style=f"bold {COLOR_ERROR}",
+            ))
+        else:
+            table.add_row(Text(""))
+            for option in options:
+                line = Text()
+                line.append(
+                    "› " if option["highlighted"] else "  ",
+                    style=f"bold {COLOR_ACCENT}",
+                )
+                line.append(
+                    f"[{option['badge']}] ",
+                    style=f"bold {COLOR_TITLE}",
+                )
+                line.append(
+                    self._truncate(
+                        option["label"], max(10, width - len(option["provider"]) - 16)
+                    ),
+                    style="bold white" if option["highlighted"] else "white",
+                )
+                if option["provider"] and option["provider"] not in option["label"]:
+                    line.append(
+                        f"  {option['provider']}",
+                        style=f"dim {COLOR_SECONDARY_TEXT}",
+                    )
+                if option["selected"]:
+                    line.append("  ✓", style=f"bold {COLOR_SUCCESS}")
+                table.add_row(line)
+
+        if not compact:
+            table.add_row(Text(""))
+        table.add_row(Text("READY CHECK", style=f"bold {COLOR_SUBTITLE}"))
+        if not lobby["members"]:
+            table.add_row(Text(
+                "Loading members...",
+                style=f"dim {COLOR_SECONDARY_TEXT}",
+            ))
+        for member in lobby["members"]:
+            line = Text()
+            line.append(
+                f"[{member['marker']}] ",
+                style=f"bold {COLOR_SUCCESS if member['ready'] else COLOR_TITLE}",
+            )
+            line.append(
+                self._truncate(member["name"], max(8, width - 30)),
+                style="bold white" if member["is_you"] else "white",
+            )
+            if member["is_you"]:
+                line.append("  You", style=f"bold {COLOR_TITLE}")
+            if member["is_host"]:
+                line.append("  [Host]", style=f"bold {COLOR_SUCCESS}")
+            if member["ready"]:
+                line.append(
+                    f"  ({member['mode_label'] or 'Ready'})",
+                    style=f"dim {COLOR_SECONDARY_TEXT}",
+                )
+            else:
+                line.append(
+                    "  (Selecting...)",
+                    style=f"dim {COLOR_SECONDARY_TEXT}",
+                )
+            table.add_row(line)
+
+        if model["is_host"] and not lobby["all_ready"]:
+            if lobby["can_start_anyway"]:
+                table.add_row(Text(
+                    "Everyone isn't ready yet. Press [s] to start anyway.",
+                    style=f"bold {COLOR_TITLE}",
+                ))
+            else:
+                table.add_row(Text(
+                    "Start Anyway unlocks in "
+                    f"{lobby['remaining']}s or when everyone is ready.",
+                    style=f"dim {COLOR_SECONDARY_TEXT}",
+                ))
+        elif not model["is_host"] and lobby["ready"]:
+            table.add_row(Text(
+                "Waiting for the host to start...",
+                style=f"dim {COLOR_SECONDARY_TEXT}",
+            ))
+        return table
 
     def _members_view(
         self, model: Dict[str, Any], width: int, compact: bool = False
@@ -2139,6 +2954,16 @@ class WatchTogetherUI:
         self, model: Dict[str, Any], width: int, show_diagnostics: bool
     ) -> Text:
         entries: List[Tuple[str, str, str]] = []
+        lobby = model.get("lobby") or {}
+        if lobby and not lobby.get("started"):
+            entries.append(("↑↓", "Choose", COLOR_PROMPT))
+            entries.append((
+                "ENTER",
+                "Update" if lobby.get("ready") else "Ready",
+                COLOR_SUCCESS,
+            ))
+            if lobby.get("can_start_anyway") and model["is_host"]:
+                entries.append(("s", "Start Anyway", COLOR_ACCENT))
         if model["is_host"]:
             # Guests stay on the room screen; only the host can detach the
             # room view and drive playback from the main menus.
